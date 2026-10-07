@@ -1,3 +1,4 @@
+using System.Text;
 using Consolus;
 using Kalk.Core;
 using Scriban;
@@ -20,12 +21,20 @@ public sealed class KalkSession
         "readonly", "with", "capture", "ret", "wrap", "do", "null", "true", "false",
     };
 
+    private const string LibraryFileName = "library.kalk";
+
     private readonly KalkEngine _engine;
     private readonly object _engineLock = new object();
+    private readonly string? _libraryFilePath;
+    // Symbols and modules owned by the library; config.kalk definitions stay out unless redefined
+    private readonly HashSet<string> _librarySymbols = new HashSet<string>(StringComparer.Ordinal);
+    private readonly HashSet<string> _libraryModules = new HashSet<string>(StringComparer.Ordinal);
+    private readonly List<LibraryLoadError> _libraryLoadErrors = new List<LibraryLoadError>();
     private CancellationTokenSource? _runningEvaluation;
 
-    /// <param name="kalkUserFolder">Overrides ~/.kalk (where config.kalk lives).</param>
-    public KalkSession(Func<string> getClipboardText, Action<string> setClipboardText, Action onClearScreen, bool loadUserConfig = true, string? kalkUserFolder = null)
+    /// <param name="kalkUserFolder">Overrides ~/.kalk (where config.kalk and library.kalk live).</param>
+    /// <param name="useLibrary">Load library.kalk at start and save every definition to it.</param>
+    public KalkSession(Func<string> getClipboardText, Action<string> setClipboardText, Action onClearScreen, bool loadUserConfig = true, string? kalkUserFolder = null, bool useLibrary = true)
     {
         // Same test as KalkEngine.Run(): with an attached interactive console it would enter its blocking REPL
         if (!Console.IsInputRedirected && !Console.IsOutputRedirected && ConsoleHelper.HasInteractiveConsole)
@@ -55,6 +64,12 @@ public sealed class KalkSession
         // Non-interactive run: loads ~/.kalk/config.kalk, reads the empty input, returns
         _engine.Run();
         StartupOutput = startupOutput.ToString();
+
+        if (useLibrary)
+        {
+            _libraryFilePath = Path.Combine(_engine.KalkUserFolder, LibraryFileName);
+            LoadLibrary();
+        }
     }
 
     public string Version => _engine.Version;
@@ -64,11 +79,31 @@ public sealed class KalkSession
 
     public string ConfigFilePath => Path.Combine(_engine.KalkUserFolder, "config.kalk");
 
+    /// <summary>The persistent library, or null when the session runs without one.</summary>
+    public string? LibraryFilePath => _libraryFilePath;
+
+    /// <summary>Library entries that don't load; they stay in the file until fixed (replacesSymbol) or discarded.</summary>
+    public IReadOnlyList<LibraryLoadError> LibraryLoadErrors => _libraryLoadErrors;
+
+    /// <summary>Drops a library entry that failed to load. False while an evaluation runs.</summary>
+    public bool DiscardBrokenEntry(string entry)
+    {
+        return ReadEngine(() =>
+        {
+            if (_libraryLoadErrors.RemoveAll(error => error.Entry == entry) > 0)
+            {
+                TrySaveLibrary();
+            }
+            return true;
+        }, false);
+    }
+
     public KalkDisplayMode DisplayMode => _engine.CurrentDisplay;
 
     public bool IsEvaluating => _runningEvaluation != null;
 
-    public async Task<EvaluationResult> EvaluateAsync(string input)
+    /// <param name="replacesSymbol">Library entry being edited: if the input defines another name, this one is deleted.</param>
+    public async Task<EvaluationResult> EvaluateAsync(string input, string? replacesSymbol = null)
     {
         if (_runningEvaluation != null)
         {
@@ -79,7 +114,7 @@ public sealed class KalkSession
         _runningEvaluation = cancellation;
         try
         {
-            return await Task.Run(() => Evaluate(input, cancellation.Token));
+            return await Task.Run(() => Evaluate(input, replacesSymbol, cancellation.Token));
         }
         finally
         {
@@ -189,7 +224,8 @@ public sealed class KalkSession
     {
         return ReadEngine<IReadOnlyList<UserSymbol>>(() => _engine.Variables
             .OrderBy(pair => pair.Key, StringComparer.Ordinal)
-            .Select(pair => new UserSymbol(pair.Key, pair.Value is ScriptFunction { IsAnonymous: false }, DescribeUserSymbol(pair.Key, pair.Value)))
+            .Select(pair => new UserSymbol(pair.Key, pair.Value is ScriptFunction { IsAnonymous: false }, DescribeUserSymbol(pair.Key, pair.Value), _librarySymbols.Contains(pair.Key)))
+            .Concat(_libraryLoadErrors.Select(error => new UserSymbol(error.Entry, false, error.Entry, true, error.Message)))
             .ToList(), Array.Empty<UserSymbol>());
     }
 
@@ -213,7 +249,7 @@ public sealed class KalkSession
         return isParentless ? $"{name} {arguments}" : $"{name}({arguments})";
     }
 
-    private EvaluationResult Evaluate(string input, CancellationToken cancellationToken)
+    private EvaluationResult Evaluate(string input, string? replacesSymbol, CancellationToken cancellationToken)
     {
         lock (_engineLock)
         {
@@ -221,36 +257,197 @@ public sealed class KalkSession
             _engine.OutputWriter = output;
             _engine.ErrorWriter = output;
             _engine.CancellationToken = cancellationToken;
+            Dictionary<string, object> variablesBefore = SnapshotVariables();
+            HashSet<string> modulesBefore = GetImportedModuleNames();
+            EvaluationResult result;
             try
             {
-                Template template = _engine.Parse(input);
-                if (template.HasErrors)
-                {
-                    LogMessage error = template.Messages.FirstOrDefault(message => message.Type == ParserMessageType.Error) ?? template.Messages[0];
-                    return Failure(input, output, error.Message, error.Span.Start);
-                }
-
-                // Statements echo themselves (`# input`, `out = ...`) into OutputWriter
-                _engine.EvaluatePage(template.Page);
-                return new EvaluationResult(input, output.ToString(), null, -1, -1, false, _engine.HasExit);
-            }
-            catch (ScriptAbortException)
-            {
-                return new EvaluationResult(input, output.ToString(), "Evaluation cancelled.", -1, -1, true, false);
-            }
-            catch (ScriptRuntimeException exception)
-            {
-                return Failure(input, output, exception.OriginalMessage, exception.Span.Start);
-            }
-            catch (Exception exception)
-            {
-                return Failure(input, output, exception.Message, new TextPosition(-1, -1, -1));
+                result = EvaluateCore(input, output, recordHistory: true);
             }
             finally
             {
                 _engine.CancellationToken = CancellationToken.None;
             }
+
+            List<string> definedNames = TrackLibraryChanges(variablesBefore, modulesBefore, out bool isLibraryChanged);
+            if (result.IsSuccess && replacesSymbol != null)
+            {
+                // A fixed broken entry (identified by its raw text) or an entry edited under a new name
+                isLibraryChanged |= _libraryLoadErrors.RemoveAll(error => error.Entry == replacesSymbol) > 0;
+                if (!definedNames.Contains(replacesSymbol) && _engine.Variables.ContainsKey(replacesSymbol))
+                {
+                    _engine.Variables.Remove(replacesSymbol);
+                    isLibraryChanged |= _librarySymbols.Remove(replacesSymbol);
+                }
+            }
+
+            string? warning = isLibraryChanged ? TrySaveLibrary() : null;
+            return result with { DefinedNames = definedNames, Warning = warning };
         }
+    }
+
+    private EvaluationResult EvaluateCore(string input, StringWriter output, bool recordHistory)
+    {
+        try
+        {
+            Template template = _engine.Parse(input, recordHistory: recordHistory);
+            if (template.HasErrors)
+            {
+                LogMessage error = template.Messages.FirstOrDefault(message => message.Type == ParserMessageType.Error) ?? template.Messages[0];
+                return Failure(input, output, error.Message, error.Span.Start);
+            }
+
+            // Statements echo themselves (`# input`, `out = ...`) into OutputWriter
+            _engine.EvaluatePage(template.Page);
+            return new EvaluationResult(input, output.ToString(), null, -1, -1, false, _engine.HasExit);
+        }
+        catch (ScriptAbortException)
+        {
+            return new EvaluationResult(input, output.ToString(), "Evaluation cancelled.", -1, -1, true, false);
+        }
+        catch (ScriptRuntimeException exception)
+        {
+            return Failure(input, output, exception.OriginalMessage, exception.Span.Start);
+        }
+        catch (Exception exception)
+        {
+            return Failure(input, output, exception.Message, new TextPosition(-1, -1, -1));
+        }
+    }
+
+    // ---- Library ----
+
+    private void LoadLibrary()
+    {
+        if (_libraryFilePath == null || !File.Exists(_libraryFilePath))
+        {
+            return;
+        }
+
+        StringWriter discardedOutput = new StringWriter();
+        _engine.OutputWriter = discardedOutput;
+        _engine.ErrorWriter = discardedOutput;
+        // One entry at a time: a broken entry must not take the others down
+        foreach (string entry in SplitLibraryEntries(File.ReadAllText(_libraryFilePath)))
+        {
+            if (entry.StartsWith("import ", StringComparison.Ordinal))
+            {
+                // Kept even when config.kalk already imports it
+                _libraryModules.Add(entry["import ".Length..].Trim());
+            }
+
+            Dictionary<string, object> variablesBefore = SnapshotVariables();
+            HashSet<string> modulesBefore = GetImportedModuleNames();
+            EvaluationResult result = EvaluateCore(entry, discardedOutput, recordHistory: false);
+            TrackLibraryChanges(variablesBefore, modulesBefore, out _);
+            if (!result.IsSuccess)
+            {
+                _libraryLoadErrors.Add(new LibraryLoadError(entry, result.Error!));
+            }
+        }
+    }
+
+    /// <summary>Top-level statements of the library file (multi-line definitions stay whole).</summary>
+    private List<string> SplitLibraryEntries(string text)
+    {
+        Template template = _engine.Parse(text, recordHistory: false);
+        IEnumerable<string> entries = !template.HasErrors && template.Page?.Body != null
+            ? template.Page.Body.Statements.Select(statement => text.Substring(statement.Span.Start.Offset, statement.Span.End.Offset - statement.Span.Start.Offset + 1))
+            // Unparsable file (hand edit gone wrong): fall back to one entry per line
+            : text.Split('\n');
+        return entries
+            .Select(entry => entry.Trim())
+            .Where(entry => entry.Length > 0 && !entry.StartsWith('#'))
+            .ToList();
+    }
+
+    /// <summary>Updates the library sets from what an evaluation changed; returns the (re)defined names.</summary>
+    private List<string> TrackLibraryChanges(Dictionary<string, object> variablesBefore, HashSet<string> modulesBefore, out bool isLibraryChanged)
+    {
+        isLibraryChanged = false;
+        List<string> definedNames = new List<string>();
+        foreach (KeyValuePair<string, object> pair in _engine.Variables)
+        {
+            // Assignments always store a new object, so a reference change means (re)defined
+            if (!variablesBefore.TryGetValue(pair.Key, out object? previousValue) || !ReferenceEquals(previousValue, pair.Value))
+            {
+                definedNames.Add(pair.Key);
+                _librarySymbols.Add(pair.Key);
+                isLibraryChanged = true;
+            }
+        }
+
+        foreach (string name in variablesBefore.Keys.Where(name => !_engine.Variables.ContainsKey(name)))
+        {
+            isLibraryChanged |= _librarySymbols.Remove(name);
+        }
+
+        foreach (string module in GetImportedModuleNames().Where(module => !modulesBefore.Contains(module)))
+        {
+            isLibraryChanged |= _libraryModules.Add(module);
+        }
+
+        return definedNames;
+    }
+
+    private string? TrySaveLibrary()
+    {
+        if (_libraryFilePath == null)
+        {
+            return null;
+        }
+
+        try
+        {
+            SaveLibrary(_libraryFilePath);
+            return null;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return $"Library not saved: {exception.Message}";
+        }
+    }
+
+    private void SaveLibrary(string path)
+    {
+        StringBuilder text = new StringBuilder();
+        text.AppendLine("# KalkGui library: every function and variable you define, reloaded on each start.");
+        text.AppendLine("# Rewritten by KalkGui on every change (comments are not kept). Edit entries from the Library tab.");
+
+        // `import All` already covers every other module
+        IEnumerable<string> modules = _libraryModules.Contains("All") ? new[] { "All" } : _libraryModules.OrderBy(module => module, StringComparer.Ordinal);
+        foreach (string module in modules)
+        {
+            text.AppendLine($"import {module}");
+        }
+
+        foreach (string name in _librarySymbols.Where(_engine.Variables.ContainsKey).OrderBy(name => name, StringComparer.Ordinal))
+        {
+            text.AppendLine(DescribeUserSymbol(name, _engine.Variables[name]));
+        }
+
+        // Kept verbatim so nothing is lost; retried on every load
+        foreach (LibraryLoadError error in _libraryLoadErrors)
+        {
+            text.AppendLine($"# Not loaded: {error.Message.ReplaceLineEndings(" ")}");
+            text.AppendLine(error.Entry);
+        }
+
+        // Write-then-move so a crash never leaves a truncated library
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        string temporaryPath = path + ".tmp";
+        File.WriteAllText(temporaryPath, text.ToString(), new UTF8Encoding(false));
+        File.Move(temporaryPath, path, overwrite: true);
+    }
+
+    private Dictionary<string, object> SnapshotVariables()
+    {
+        return _engine.Variables.ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+    }
+
+    private HashSet<string> GetImportedModuleNames()
+    {
+        return GetModuleObjects().Where(module => module.IsImported).Select(module => module.Name).ToHashSet(StringComparer.Ordinal);
     }
 
     private static EvaluationResult Failure(string input, StringWriter output, string error, TextPosition position)

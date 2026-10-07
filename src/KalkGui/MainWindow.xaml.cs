@@ -23,9 +23,17 @@ public partial class MainWindow : Window
 {
     private const int MaxTranscriptBlocks = 4000;
 
+    private enum EvaluationSource
+    {
+        InputEditor,
+        Command,
+        LibraryEditor,
+    }
+
     private readonly InputHistory _history;
     private readonly KalkEditorHighlighting _inputHighlighting;
     private readonly KalkEditorHighlighting _configHighlighting;
+    private readonly KalkEditorHighlighting _libraryHighlighting;
     private readonly FontFamily _monoFont;
     private readonly string? _kalkUserFolder;
     private KalkSession? _session;
@@ -34,6 +42,11 @@ public partial class MainWindow : Window
     private string _importedModules = string.Empty;
     private bool _isSyncingDisplayMode;
     private bool _isConfigDirty;
+    // Library entry shown in the Library tab editor, and whether the user changed its text
+    private string? _editedSymbolName;
+    private bool _isLibraryEditDirty;
+    private bool _isLoadingLibraryEditor;
+    private bool _isRefreshingSymbols;
     // Set from the evaluation thread by kalk's `clear` command
     private volatile bool _clearRequested;
 
@@ -49,10 +62,14 @@ public partial class MainWindow : Window
 
         ConfigureEditor(InputEditor);
         ConfigureEditor(ConfigEditor);
+        ConfigureEditor(LibraryEditor);
         _inputHighlighting = new KalkEditorHighlighting(InputEditor, () => _session, matchBraces: true);
         _configHighlighting = new KalkEditorHighlighting(ConfigEditor, () => _session, matchBraces: false);
+        _libraryHighlighting = new KalkEditorHighlighting(LibraryEditor, () => _session, matchBraces: true);
         InputEditor.TextArea.PreviewKeyDown += OnInputPreviewKeyDown;
+        LibraryEditor.TextArea.PreviewKeyDown += OnLibraryEditorPreviewKeyDown;
         ConfigEditor.TextChanged += (_, _) => SetConfigDirty(true);
+        LibraryEditor.TextChanged += (_, _) => _isLibraryEditDirty |= !_isLoadingLibraryEditor;
 
         // --background: open behind the other windows without taking focus (UI automation, autostart)
         if (Environment.GetCommandLineArgs().Contains("--background", StringComparer.OrdinalIgnoreCase))
@@ -131,25 +148,31 @@ public partial class MainWindow : Window
         Title = $"KalkGui - kalk {version}";
         VersionText.Text = $"kalk {version}";
         AppendOutput(_session.StartupOutput);
+        foreach (LibraryLoadError error in _session.LibraryLoadErrors)
+        {
+            AppendNote($"# library.kalk: `{error.Entry}` was not loaded: {error.Message}", KalkPalette.Error);
+        }
+        LibraryPathText.Text = $"Saved to {_session.LibraryFilePath} and reloaded on every start";
         _docView = null;
         RefreshPanels();
         _inputHighlighting.Refresh();
         _configHighlighting.Refresh();
+        _libraryHighlighting.Refresh();
     }
 
     private void RestartSession()
     {
         _session?.CancelEvaluation();
-        AppendNote("# Engine restarted: config.kalk reloaded, session variables and functions cleared");
+        AppendNote("# Engine restarted: config.kalk and library.kalk reloaded");
         StartSession();
     }
 
-    private async Task EvaluateAsync(string input, bool fromInputEditor)
+    private async Task<EvaluationResult?> EvaluateAsync(string input, EvaluationSource source, string? replacesSymbol = null)
     {
         KalkSession? session = _session;
         if (session == null || session.IsEvaluating || string.IsNullOrWhiteSpace(input))
         {
-            return;
+            return null;
         }
 
         _clearRequested = false;
@@ -157,7 +180,7 @@ public partial class MainWindow : Window
         EvaluationResult result;
         try
         {
-            result = await session.EvaluateAsync(input);
+            result = await session.EvaluateAsync(input, replacesSymbol);
         }
         finally
         {
@@ -167,7 +190,7 @@ public partial class MainWindow : Window
         // The engine was restarted while this evaluation ran
         if (session != _session)
         {
-            return;
+            return null;
         }
 
         if (result.IsSuccess)
@@ -182,7 +205,7 @@ public partial class MainWindow : Window
                 AppendInput(input);
                 AppendOutput(result.Output);
             }
-            if (fromInputEditor)
+            if (source == EvaluationSource.InputEditor)
             {
                 _history.Add(input.Trim());
                 InputEditor.Text = string.Empty;
@@ -190,7 +213,11 @@ public partial class MainWindow : Window
         }
         else
         {
-            ShowError(result, fromInputEditor);
+            ShowError(result, source);
+        }
+        if (result.Warning != null)
+        {
+            StatusText.Text = result.Warning;
         }
 
         RefreshPanels();
@@ -198,11 +225,12 @@ public partial class MainWindow : Window
         {
             Close();
         }
+        return result;
     }
 
     private async Task ImportModuleAsync(string moduleName)
     {
-        await EvaluateAsync($"import {moduleName}", fromInputEditor: false);
+        await EvaluateAsync($"import {moduleName}", EvaluationSource.Command);
         FocusInput();
     }
 
@@ -219,7 +247,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        SymbolList.ItemsSource = _session.GetUserSymbols();
+        RefreshSymbols();
         SyncDisplayMode();
 
         string importedModules = string.Join(",", _session.GetModules().Where(module => module.IsImported).Select(module => module.Name));
@@ -295,9 +323,9 @@ public partial class MainWindow : Window
         }
     }
 
-    private void AppendNote(string note)
+    private void AppendNote(string note, Brush? brush = null)
     {
-        AddTranscriptBlock(new Paragraph(new Run(note) { Foreground = KalkPalette.Prompt }) { Margin = new Thickness(0, 8, 0, 0) });
+        AddTranscriptBlock(new Paragraph(new Run(note) { Foreground = brush ?? KalkPalette.Prompt }) { Margin = new Thickness(0, 8, 0, 0) });
     }
 
     private void AddTranscriptBlock(Block block)
@@ -358,7 +386,7 @@ public partial class MainWindow : Window
         {
             case Key.Enter when (modifiers & ModifierKeys.Shift) == 0:
                 e.Handled = true;
-                await EvaluateAsync(InputEditor.Text, fromInputEditor: true);
+                await EvaluateAsync(InputEditor.Text, EvaluationSource.InputEditor);
                 break;
             case Key.Up when InputEditor.TextArea.Caret.Line == 1:
                 if (_history.TryGetPrevious(InputEditor.Text, out string previous))
@@ -394,7 +422,7 @@ public partial class MainWindow : Window
 
     private async void OnEvaluateClick(object sender, RoutedEventArgs e)
     {
-        await EvaluateAsync(InputEditor.Text, fromInputEditor: true);
+        await EvaluateAsync(InputEditor.Text, EvaluationSource.InputEditor);
         FocusInput();
     }
 
@@ -485,13 +513,21 @@ public partial class MainWindow : Window
         InputEditor.CaretOffset = text.Length;
     }
 
-    private void ShowError(EvaluationResult result, bool fromInputEditor)
+    private void ShowError(EvaluationResult result, EvaluationSource source)
     {
-        ErrorText.Text = fromInputEditor ? result.Error : $"{result.Input.Trim()}: {result.Error}";
+        if (source == EvaluationSource.LibraryEditor)
+        {
+            LibraryErrorText.Text = result.Error;
+            LibraryErrorText.Visibility = Visibility.Visible;
+            return;
+        }
+
+        bool isFromInputEditor = source == EvaluationSource.InputEditor;
+        ErrorText.Text = isFromInputEditor ? result.Error : $"{result.Input.Trim()}: {result.Error}";
         ErrorText.Visibility = Visibility.Visible;
 
         TextDocument document = InputEditor.Document;
-        if (fromInputEditor && result.ErrorLine >= 0 && result.ErrorLine < document.LineCount && result.ErrorColumn >= 0)
+        if (isFromInputEditor && result.ErrorLine >= 0 && result.ErrorLine < document.LineCount && result.ErrorColumn >= 0)
         {
             DocumentLine line = document.GetLineByNumber(result.ErrorLine + 1);
             InputEditor.CaretOffset = line.Offset + Math.Min(result.ErrorColumn, line.Length);
@@ -541,7 +577,7 @@ public partial class MainWindow : Window
         {
             return;
         }
-        await EvaluateAsync($"display {mode}", fromInputEditor: false);
+        await EvaluateAsync($"display {mode}", EvaluationSource.Command);
         FocusInput();
     }
 
@@ -638,6 +674,86 @@ public partial class MainWindow : Window
 
     private UserSymbol? SelectedSymbol => SymbolList.SelectedItem as UserSymbol;
 
+    /// <summary>Reloads the list, keeping the edited entry selected and any unapplied edit of it.</summary>
+    private void RefreshSymbols()
+    {
+        IReadOnlyList<UserSymbol> symbols = _session!.GetUserSymbols();
+        UserSymbol? editedSymbol = symbols.FirstOrDefault(symbol => symbol.Name == _editedSymbolName);
+        _isRefreshingSymbols = true;
+        SymbolList.ItemsSource = symbols;
+        SymbolList.SelectedItem = editedSymbol;
+        _isRefreshingSymbols = false;
+        if (!_isLibraryEditDirty)
+        {
+            LoadLibraryEditor(editedSymbol);
+        }
+    }
+
+    private void OnSymbolSelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        // Picking another entry discards an unapplied edit, like a list-detail form
+        if (!_isRefreshingSymbols)
+        {
+            LoadLibraryEditor(SelectedSymbol);
+        }
+    }
+
+    private void LoadLibraryEditor(UserSymbol? symbol)
+    {
+        _editedSymbolName = symbol?.Name;
+        _isLoadingLibraryEditor = true;
+        LibraryEditor.Text = symbol?.Definition ?? string.Empty;
+        _isLoadingLibraryEditor = false;
+        _isLibraryEditDirty = false;
+        // A broken entry shows why it did not load, so it can be fixed in place
+        LibraryErrorText.Text = symbol?.LoadError ?? string.Empty;
+        LibraryErrorText.Visibility = symbol?.IsBroken == true ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    /// <summary>Evaluates the edited entry; a new name replaces the old entry.</summary>
+    private async Task ApplyLibraryEditAsync()
+    {
+        EvaluationResult? result = await EvaluateAsync(LibraryEditor.Text, EvaluationSource.LibraryEditor, replacesSymbol: _editedSymbolName);
+        if (result is { IsSuccess: true })
+        {
+            _editedSymbolName = result.DefinedNames.FirstOrDefault() ?? _editedSymbolName;
+            _isLibraryEditDirty = false;
+            RefreshSymbols();
+        }
+    }
+
+    private async void OnLibraryEditorPreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter && (Keyboard.Modifiers & ModifierKeys.Shift) == 0)
+        {
+            e.Handled = true;
+            await ApplyLibraryEditAsync();
+        }
+        else if (e.Key == Key.Escape)
+        {
+            e.Handled = true;
+            LoadLibraryEditor(SelectedSymbol);
+        }
+    }
+
+    private async void OnLibraryApplyClick(object sender, RoutedEventArgs e)
+    {
+        await ApplyLibraryEditAsync();
+    }
+
+    private void OnLibraryRevertClick(object sender, RoutedEventArgs e)
+    {
+        LoadLibraryEditor(SelectedSymbol);
+    }
+
+    private void OnOpenLibraryClick(object sender, RoutedEventArgs e)
+    {
+        if (_session?.LibraryFilePath is string path)
+        {
+            RevealInExplorer(path);
+        }
+    }
+
     private void InsertSymbol(UserSymbol symbol)
     {
         InsertIntoInput(symbol.IsFunction ? $"{symbol.Name}(" : symbol.Name);
@@ -661,17 +777,28 @@ public partial class MainWindow : Window
 
     private async void OnSymbolDeleteClick(object sender, RoutedEventArgs e)
     {
-        if (SelectedSymbol is UserSymbol symbol)
+        if (SelectedSymbol is not UserSymbol symbol)
         {
-            await EvaluateAsync($"del {symbol.Name}", fromInputEditor: false);
+            return;
         }
+
+        if (symbol.IsBroken)
+        {
+            // Not a kalk symbol: only the library file holds it
+            if (_session?.DiscardBrokenEntry(symbol.Name) == true)
+            {
+                RefreshPanels();
+            }
+            return;
+        }
+        await EvaluateAsync($"del {symbol.Name}", EvaluationSource.Command);
     }
 
     private async void OnSymbolResetClick(object sender, RoutedEventArgs e)
     {
-        if (MessageBox.Show(this, "Delete all variables and functions defined in this session?", "KalkGui", MessageBoxButton.OKCancel, MessageBoxImage.Question) == MessageBoxResult.OK)
+        if (MessageBox.Show(this, "Delete every variable and function, including the whole library?", "KalkGui", MessageBoxButton.OKCancel, MessageBoxImage.Warning) == MessageBoxResult.OK)
         {
-            await EvaluateAsync("reset", fromInputEditor: false);
+            await EvaluateAsync("reset", EvaluationSource.Command);
         }
     }
 
@@ -736,7 +863,11 @@ public partial class MainWindow : Window
 
     private void OnOpenConfigFolderClick(object sender, RoutedEventArgs e)
     {
-        string path = _session!.ConfigFilePath;
+        RevealInExplorer(_session!.ConfigFilePath);
+    }
+
+    private static void RevealInExplorer(string path)
+    {
         string folder = Path.GetDirectoryName(path)!;
         Directory.CreateDirectory(folder);
         string arguments = File.Exists(path) ? $"/select,\"{path}\"" : $"\"{folder}\"";

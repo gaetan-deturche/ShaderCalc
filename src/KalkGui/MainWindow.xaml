@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:avalonEdit="http://icsharpcode.net/sharpdevelop/avalonedit"
         xmlns:engine="clr-namespace:KalkGui.Engine;assembly=KalkGui.Engine"
-        Title="KalkGui" Width="1280" Height="820" MinWidth="720" MinHeight="420"
+        Title="KalkGui" Icon="Assets/kalkgui.ico" Width="1280" Height="820" MinWidth="720" MinHeight="420"
         Loaded="OnLoaded" Activated="OnActivated" Closing="OnClosing" PreviewKeyDown="OnWindowPreviewKeyDown" KeyDown="OnWindowKeyDown">
     <Window.Resources>
         <!-- Fluent TabItem template (dotnet/wpf release/9.0, top placement only) minus its hardcoded MinWidth="180",
@@ -44,7 +44,7 @@
             </ComboBox>
             <Button x:Name="ImportButton" Content="Import module..." Margin="12,0,0,0" Click="OnImportButtonClick"/>
             <Button DockPanel.Dock="Right" Content="Restart engine" Margin="8,0,0,0" Click="OnRestartClick"
-                    ToolTip="New kalk engine: reloads config.kalk and drops session variables and functions"/>
+                    ToolTip="New kalk engine: reloads config.kalk and the library"/>
             <Button DockPanel.Dock="Right" Content="Clear" Click="OnClearClick" ToolTip="Clear the transcript (Ctrl+L)"/>
         </DockPanel>
 
@@ -78,7 +78,7 @@
                                  VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
                                  PreviewMouseDoubleClick="OnTranscriptDoubleClick">
                         <!-- FlowDocument does not inherit the RichTextBox font -->
-                        <FlowDocument x:Name="Transcript" PagePadding="10,8" FontFamily="{StaticResource MonoFont}" FontSize="14"/>
+                        <FlowDocument x:Name="Transcript" PagePadding="10,8" FontFamily="{StaticResource MonoFont}" FontSize="14" TextAlignment="Left"/>
                     </RichTextBox>
 
                     <TextBlock x:Name="ErrorText" Grid.Row="1" Visibility="Collapsed" Foreground="#E74856"
@@ -158,23 +158,63 @@
                 </TabItem>
 
                 <TabItem x:Name="LibraryTab" Header="Library">
-                    <DockPanel Margin="0,6,0,0">
-                        <TextBlock DockPanel.Dock="Top" Text="Variables and functions defined in this session" Opacity="0.7" Margin="2,0,0,6"/>
-                        <WrapPanel DockPanel.Dock="Bottom" HorizontalAlignment="Right" Margin="0,6,0,0">
-                            <Button Content="Insert" Margin="0,0,6,0" Click="OnSymbolInsertClick"/>
-                            <Button Content="Add to config.kalk" Margin="0,0,6,0" Click="OnSymbolToConfigClick"
-                                    ToolTip="Append the definition to config.kalk so it exists in every session"/>
-                            <Button Content="Delete" Margin="0,0,6,0" Click="OnSymbolDeleteClick"/>
-                            <Button Content="Delete all" Click="OnSymbolResetClick"/>
-                        </WrapPanel>
-                        <ListBox x:Name="SymbolList" MouseDoubleClick="OnSymbolDoubleClick">
+                    <Grid Margin="0,6,0,0">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <TextBlock x:Name="LibraryPathText" Opacity="0.7" TextTrimming="CharacterEllipsis" Margin="2,0,0,6"/>
+
+                        <ListBox x:Name="SymbolList" Grid.Row="1" MouseDoubleClick="OnSymbolDoubleClick"
+                                 SelectionChanged="OnSymbolSelectionChanged" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                             <ListBox.ItemTemplate>
                                 <DataTemplate DataType="{x:Type engine:UserSymbol}">
-                                    <TextBlock Text="{Binding Definition}" FontFamily="{StaticResource MonoFont}" TextTrimming="CharacterEllipsis"/>
+                                    <DockPanel>
+                                        <TextBlock x:Name="ConfigTag" DockPanel.Dock="Right" Text="config.kalk" FontSize="11" Opacity="0.6"
+                                                   Margin="8,0,0,0" VerticalAlignment="Center" Visibility="Collapsed"
+                                                   ToolTip="Defined in config.kalk; editing it here moves it to the library"/>
+                                        <TextBlock x:Name="ErrorTag" DockPanel.Dock="Right" Text="error" FontSize="11" Foreground="#E74856"
+                                                   Margin="8,0,0,0" VerticalAlignment="Center" Visibility="Collapsed"
+                                                   ToolTip="{Binding LoadError}"/>
+                                        <TextBlock Text="{Binding Definition}" FontFamily="{StaticResource MonoFont}" TextTrimming="CharacterEllipsis"/>
+                                    </DockPanel>
+                                    <DataTemplate.Triggers>
+                                        <DataTrigger Binding="{Binding IsInLibrary}" Value="False">
+                                            <Setter TargetName="ConfigTag" Property="Visibility" Value="Visible"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsBroken}" Value="True">
+                                            <Setter TargetName="ErrorTag" Property="Visibility" Value="Visible"/>
+                                        </DataTrigger>
+                                    </DataTemplate.Triggers>
                                 </DataTemplate>
                             </ListBox.ItemTemplate>
                         </ListBox>
-                    </DockPanel>
+
+                        <TextBlock Grid.Row="2" Text="Selected entry (Enter applies, Shift+Enter new line, Esc reverts)" Opacity="0.7" Margin="2,8,0,4"/>
+                        <Border Grid.Row="3" Background="#181818" CornerRadius="4">
+                            <avalonEdit:TextEditor x:Name="LibraryEditor" FontFamily="{StaticResource MonoFont}" FontSize="13"
+                                                   Background="Transparent" Foreground="#CCCCCC" MinHeight="30" MaxHeight="140"
+                                                   VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" Padding="6,5"/>
+                        </Border>
+                        <TextBlock x:Name="LibraryErrorText" Grid.Row="4" Visibility="Collapsed" Foreground="#E74856" TextWrapping="Wrap"
+                                   FontFamily="{StaticResource MonoFont}" FontSize="12" Margin="2,4,0,0"/>
+
+                        <WrapPanel Grid.Row="5" HorizontalAlignment="Right" Margin="0,6,0,0">
+                            <Button Content="Apply" Margin="0,0,6,0" Click="OnLibraryApplyClick" ToolTip="Evaluate the edited entry and save it (Enter)"/>
+                            <Button Content="Revert" Margin="0,0,16,0" Click="OnLibraryRevertClick" ToolTip="Discard the edit (Esc)"/>
+                            <Button Content="Insert" Margin="0,0,6,0" Click="OnSymbolInsertClick"/>
+                            <Button Content="Delete" Margin="0,0,6,0" Click="OnSymbolDeleteClick"/>
+                            <Button Content="Delete all" Margin="0,0,6,0" Click="OnSymbolResetClick"/>
+                            <Button Content="Add to config.kalk" Margin="0,0,6,0" Click="OnSymbolToConfigClick"
+                                    ToolTip="Append the definition to config.kalk"/>
+                            <Button Content="Open file" Click="OnOpenLibraryClick" ToolTip="Show library.kalk in Explorer"/>
+                        </WrapPanel>
+                    </Grid>
                 </TabItem>
 
                 <TabItem x:Name="ConfigTab" Header="Config">

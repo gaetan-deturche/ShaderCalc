@@ -12,8 +12,8 @@ internal static class DocumentationRenderer
     public static FlowDocument Build(DocEntry entry, KalkSession session, FontFamily monoFont, Action<string> importModule)
     {
         KalkDescriptor descriptor = entry.Descriptor;
-        // FlowDocument defaults to Georgia instead of inheriting the UI font
-        FlowDocument document = new FlowDocument { PagePadding = new Thickness(6, 8, 6, 8), FontSize = 13, FontFamily = SystemFonts.MessageFontFamily };
+        // FlowDocument defaults to Georgia and justified text instead of inheriting the UI's look
+        FlowDocument document = new FlowDocument { PagePadding = new Thickness(6, 8, 6, 8), FontSize = 13, FontFamily = SystemFonts.MessageFontFamily, TextAlignment = TextAlignment.Left };
 
         Paragraph signature = StyledText.CreateParagraph(entry.Signature, session.Highlight(entry.Signature));
         signature.FontFamily = monoFont;
