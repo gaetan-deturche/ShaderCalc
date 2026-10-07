@@ -34,9 +34,27 @@ internal sealed class KalkEditorHighlighting
         _editor.TextArea.TextView.Redraw();
     }
 
+    /// <summary>Red underline under a syntax error.</summary>
+    public void SetError(int start, int length)
+    {
+        _colorizer.Error = new StyledSpan(start, length, default);
+        _editor.TextArea.TextView.Redraw();
+    }
+
+    public void ClearError()
+    {
+        if (_colorizer.Error != null)
+        {
+            _colorizer.Error = null;
+            _editor.TextArea.TextView.Redraw();
+        }
+    }
+
     private sealed class SpanColorizer : DocumentColorizingTransformer
     {
         public IReadOnlyList<StyledSpan> Spans { get; set; } = Array.Empty<StyledSpan>();
+
+        public StyledSpan? Error { get; set; }
 
         protected override void ColorizeLine(DocumentLine line)
         {
@@ -49,6 +67,16 @@ internal sealed class KalkEditorHighlighting
                 {
                     KalkTextStyle style = span.Style;
                     ChangeLinePart(start, end, element => KalkPalette.Apply(element, style));
+                }
+            }
+
+            if (Error is StyledSpan error)
+            {
+                int start = Math.Max(error.Start, line.Offset);
+                int end = Math.Min(error.End, line.EndOffset);
+                if (start < end)
+                {
+                    ChangeLinePart(start, end, element => element.TextRunProperties.SetTextDecorations(KalkPalette.ErrorUnderline));
                 }
             }
         }

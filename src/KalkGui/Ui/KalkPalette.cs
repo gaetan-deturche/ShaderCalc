@@ -13,7 +13,10 @@ internal static class KalkPalette
     public static readonly Brush Foreground = CreateBrush(0xCCCCCC);
     public static readonly Brush Prompt = CreateBrush(0x767676);
     public static readonly Brush Error = CreateBrush(0xE74856);
+    // Live syntax hints: softer than evaluation errors
+    public static readonly Brush Warning = CreateBrush(0xE5C07B);
     public static readonly Brush Code = CreateBrush(0x61D6D6);
+    public static readonly TextDecorationCollection ErrorUnderline = CreateUnderline(Error);
 
     // Indexed by KalkColor
     private static readonly Brush[] Colors =
@@ -69,6 +72,15 @@ internal static class KalkPalette
         Brush foreground = Colors[(int)foregroundColor];
         Brush? background = style.Background == KalkColor.Default ? null : Colors[(int)style.Background];
         return style.Reversed ? (background ?? Background, foreground) : (foreground, background);
+    }
+
+    private static TextDecorationCollection CreateUnderline(Brush brush)
+    {
+        Pen pen = new Pen(brush, 1.5);
+        pen.Freeze();
+        TextDecorationCollection decorations = new TextDecorationCollection { new TextDecoration(TextDecorationLocation.Underline, pen, 1, TextDecorationUnit.FontRecommended, TextDecorationUnit.Pixel) };
+        decorations.Freeze();
+        return decorations;
     }
 
     private static Brush CreateBrush(int rgb)

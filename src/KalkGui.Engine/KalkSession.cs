@@ -30,6 +30,8 @@ public sealed class KalkSession
     private readonly HashSet<string> _librarySymbols = new HashSet<string>(StringComparer.Ordinal);
     private readonly HashSet<string> _libraryModules = new HashSet<string>(StringComparer.Ordinal);
     private readonly List<LibraryLoadError> _libraryLoadErrors = new List<LibraryLoadError>();
+    // What KalkGui last wrote to or read from library.kalk: a file holding anything else was edited outside
+    private string? _lastLibraryText;
     private CancellationTokenSource? _runningEvaluation;
 
     /// <param name="kalkUserFolder">Overrides ~/.kalk (where config.kalk and library.kalk live).</param>
@@ -151,6 +153,33 @@ public sealed class KalkSession
 
             return KalkStyleConverter.ToSpans(consoleText);
         }, Array.Empty<StyledSpan>());
+    }
+
+    /// <summary>Parse-only check (nothing is evaluated); null when the text parses.</summary>
+    public SyntaxProblem? CheckSyntax(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return null;
+        }
+
+        return ReadEngine<SyntaxProblem?>(() =>
+        {
+            Template template = _engine.Parse(text, recordHistory: false);
+            if (!template.HasErrors)
+            {
+                return null;
+            }
+
+            LogMessage error = template.Messages.FirstOrDefault(message => message.Type == ParserMessageType.Error) ?? template.Messages[0];
+            int offset = error.Span.Start.Offset;
+            // Errors at the end of the input (missing operand, missing `end`) point past the text
+            if (offset < 0 || offset >= text.Length)
+            {
+                offset = Math.Max(0, text.TrimEnd().Length - 1);
+            }
+            return new SyntaxProblem(error.Message, offset);
+        }, null);
     }
 
     public IReadOnlyList<CompletionItem> GetCompletions(string prefix)
@@ -324,27 +353,125 @@ public sealed class KalkSession
             return;
         }
 
+        _lastLibraryText = File.ReadAllText(_libraryFilePath);
         StringWriter discardedOutput = new StringWriter();
         _engine.OutputWriter = discardedOutput;
         _engine.ErrorWriter = discardedOutput;
         // One entry at a time: a broken entry must not take the others down
-        foreach (string entry in SplitLibraryEntries(File.ReadAllText(_libraryFilePath)))
+        foreach (string entry in SplitLibraryEntries(_lastLibraryText))
         {
-            if (entry.StartsWith("import ", StringComparison.Ordinal))
-            {
-                // Kept even when config.kalk already imports it
-                _libraryModules.Add(entry["import ".Length..].Trim());
-            }
-
-            Dictionary<string, object> variablesBefore = SnapshotVariables();
-            HashSet<string> modulesBefore = GetImportedModuleNames();
-            EvaluationResult result = EvaluateCore(entry, discardedOutput, recordHistory: false);
-            TrackLibraryChanges(variablesBefore, modulesBefore, out _);
+            EvaluationResult result = EvaluateLibraryEntry(entry, discardedOutput, out _);
             if (!result.IsSuccess)
             {
                 _libraryLoadErrors.Add(new LibraryLoadError(entry, result.Error!));
             }
         }
+    }
+
+    /// <summary>
+    /// Applies library.kalk as edited outside KalkGui: changed entries are re-evaluated, deleted ones leave the
+    /// session. Null when the file holds what KalkGui itself last wrote or read.
+    /// </summary>
+    public Task<LibraryReloadResult?> ReloadLibraryAsync()
+    {
+        return Task.Run(() =>
+        {
+            lock (_engineLock)
+            {
+                return ReloadLibrary();
+            }
+        });
+    }
+
+    private LibraryReloadResult? ReloadLibrary()
+    {
+        if (_libraryFilePath == null)
+        {
+            return null;
+        }
+
+        string text;
+        try
+        {
+            text = File.Exists(_libraryFilePath) ? File.ReadAllText(_libraryFilePath) : string.Empty;
+        }
+        catch (IOException)
+        {
+            // Still being written: the editor's next change notification retries
+            return null;
+        }
+        if (text == _lastLibraryText)
+        {
+            return null;
+        }
+        _lastLibraryText = text;
+
+        StringWriter discardedOutput = new StringWriter();
+        _engine.OutputWriter = discardedOutput;
+        _engine.ErrorWriter = discardedOutput;
+        Dictionary<string, string> currentDefinitions = _librarySymbols
+            .Where(_engine.Variables.ContainsKey)
+            .ToDictionary(name => name, name => DescribeUserSymbol(name, _engine.Variables[name]), StringComparer.Ordinal);
+        HashSet<string> namesInFile = new HashSet<string>(StringComparer.Ordinal);
+        List<string> updatedNames = new List<string>();
+        List<LibraryLoadError> errors = new List<LibraryLoadError>();
+        HashSet<string> modulesInFile = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (string entry in SplitLibraryEntries(text))
+        {
+            if (entry.StartsWith("import ", StringComparison.Ordinal))
+            {
+                modulesInFile.Add(entry["import ".Length..].Trim());
+            }
+
+            // Entries KalkGui wrote itself match the current definition exactly: no need to re-run them
+            string? unchangedName = currentDefinitions.FirstOrDefault(pair => pair.Value.ReplaceLineEndings() == entry.ReplaceLineEndings()).Key;
+            if (unchangedName != null)
+            {
+                namesInFile.Add(unchangedName);
+                continue;
+            }
+
+            EvaluationResult result = EvaluateLibraryEntry(entry, discardedOutput, out List<string> definedNames);
+            namesInFile.UnionWith(definedNames);
+            if (result.IsSuccess)
+            {
+                updatedNames.AddRange(definedNames);
+            }
+            else
+            {
+                errors.Add(new LibraryLoadError(entry, result.Error!));
+            }
+        }
+
+        List<string> removedNames = _librarySymbols.Where(name => !namesInFile.Contains(name)).OrderBy(name => name, StringComparer.Ordinal).ToList();
+        foreach (string name in removedNames)
+        {
+            _engine.Variables.Remove(name);
+            _librarySymbols.Remove(name);
+        }
+
+        // kalk cannot unload a module: dropping an import only stops recording it
+        _libraryModules.Clear();
+        _libraryModules.UnionWith(modulesInFile);
+        _libraryLoadErrors.Clear();
+        _libraryLoadErrors.AddRange(errors);
+        return new LibraryReloadResult(updatedNames, removedNames, errors);
+    }
+
+    private EvaluationResult EvaluateLibraryEntry(string entry, StringWriter output, out List<string> definedNames)
+    {
+        if (entry.StartsWith("import ", StringComparison.Ordinal))
+        {
+            // Kept even when config.kalk already imports it
+            _libraryModules.Add(entry["import ".Length..].Trim());
+        }
+
+        Dictionary<string, object> variablesBefore = SnapshotVariables();
+        HashSet<string> modulesBefore = GetImportedModuleNames();
+        EvaluationResult result = EvaluateCore(entry, output, recordHistory: false);
+        definedNames = TrackLibraryChanges(variablesBefore, modulesBefore, out _);
+        return result;
     }
 
     /// <summary>Top-level statements of the library file (multi-line definitions stay whole).</summary>
@@ -423,7 +550,7 @@ public sealed class KalkSession
 
         foreach (string name in _librarySymbols.Where(_engine.Variables.ContainsKey).OrderBy(name => name, StringComparer.Ordinal))
         {
-            text.AppendLine(DescribeUserSymbol(name, _engine.Variables[name]));
+            text.AppendLine(DescribeUserSymbol(name, _engine.Variables[name]).ReplaceLineEndings());
         }
 
         // Kept verbatim so nothing is lost; retried on every load
@@ -438,6 +565,7 @@ public sealed class KalkSession
         string temporaryPath = path + ".tmp";
         File.WriteAllText(temporaryPath, text.ToString(), new UTF8Encoding(false));
         File.Move(temporaryPath, path, overwrite: true);
+        _lastLibraryText = text.ToString();
     }
 
     private Dictionary<string, object> SnapshotVariables()
@@ -481,8 +609,39 @@ public sealed class KalkSession
     private string DescribeUserSymbol(string name, object? value)
     {
         return value is ScriptFunction { IsAnonymous: false } function
-            ? function.ToString() ?? name
+            ? IndentBlocks(function.ToString() ?? name)
             : $"{name} = {_engine.ObjectToString(value, true)}";
+    }
+
+    /// <summary>kalk prints `func ... end` bodies flush left: indent them by block depth (4 spaces).</summary>
+    private static string IndentBlocks(string text)
+    {
+        if (!text.Contains('\n'))
+        {
+            return text;
+        }
+
+        StringBuilder indented = new StringBuilder();
+        int depth = 0;
+        foreach (string rawLine in text.ReplaceLineEndings("\n").Split('\n'))
+        {
+            string line = rawLine.Trim();
+            string firstWord = line.Split(' ', 2)[0];
+            if (firstWord is "end" or "else" or "when")
+            {
+                depth = Math.Max(0, depth - 1);
+            }
+            if (indented.Length > 0)
+            {
+                indented.Append('\n');
+            }
+            indented.Append(' ', depth * 4).Append(line);
+            if (firstWord is "func" or "if" or "for" or "while" or "case" or "else" or "when" && !line.EndsWith(" end", StringComparison.Ordinal))
+            {
+                depth++;
+            }
+        }
+        return indented.ToString();
     }
 
     private string? DescribeBuiltin(string name)

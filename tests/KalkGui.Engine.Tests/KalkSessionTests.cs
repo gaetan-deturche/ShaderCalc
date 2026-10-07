@@ -262,6 +262,98 @@ public class KalkSessionTests : IDisposable
     }
 
     [Fact]
+    public async Task Library_OutsideEditIsAppliedWithoutRestart()
+    {
+        KalkSession session = CreateSession();
+        await session.EvaluateAsync("gain = 2");
+
+        File.WriteAllText(LibraryPath, "gain = 3\nscale(x) = x * 10\n");
+        LibraryReloadResult? reload = await session.ReloadLibraryAsync();
+        EvaluationResult result = await session.EvaluateAsync("scale(gain)");
+
+        Assert.NotNull(reload);
+        Assert.Equal(new[] { "gain", "scale" }, reload.UpdatedNames.OrderBy(name => name));
+        Assert.Contains("out = 30", result.Output);
+    }
+
+    [Fact]
+    public async Task Library_EntryDeletedOutsideLeavesTheSession()
+    {
+        KalkSession session = CreateSession();
+        await session.EvaluateAsync("keep = 1");
+        await session.EvaluateAsync("drop = 2");
+
+        File.WriteAllText(LibraryPath, File.ReadAllText(LibraryPath).Replace("drop = 2", string.Empty));
+        LibraryReloadResult? reload = await session.ReloadLibraryAsync();
+
+        Assert.NotNull(reload);
+        Assert.Equal(new[] { "drop" }, reload.RemovedNames);
+        Assert.Empty(reload.UpdatedNames);
+        Assert.Equal(new[] { "keep" }, session.GetUserSymbols().Select(symbol => symbol.Name));
+    }
+
+    [Fact]
+    public async Task Library_OwnSaveIsNotReloaded()
+    {
+        KalkSession session = CreateSession();
+        await session.EvaluateAsync("x = 1");
+
+        Assert.Null(await session.ReloadLibraryAsync());
+    }
+
+    [Fact]
+    public async Task Library_BrokenOutsideEditIsReported()
+    {
+        KalkSession session = CreateSession();
+        await session.EvaluateAsync("x = 1");
+
+        File.WriteAllText(LibraryPath, "x = 1\ny = 2 *\n");
+        LibraryReloadResult? reload = await session.ReloadLibraryAsync();
+
+        Assert.NotNull(reload);
+        Assert.Equal("y = 2 *", Assert.Single(reload.Errors).Entry);
+        Assert.Contains(session.GetUserSymbols(), symbol => symbol.IsBroken && symbol.Definition == "y = 2 *");
+        Assert.Contains(session.GetUserSymbols(), symbol => symbol.Name == "x" && !symbol.IsBroken);
+    }
+
+    [Fact]
+    public async Task Library_MultiLineFunctionRoundTrips()
+    {
+        KalkSession firstSession = CreateSession();
+        EvaluationResult definition = await firstSession.EvaluateAsync("func clamp01(x)\n    if x < 0\n        ret 0\n    end\n    ret x > 1 ? 1 : x\nend");
+        Assert.True(definition.IsSuccess, definition.Error);
+        string library = File.ReadAllText(LibraryPath).ReplaceLineEndings("\n");
+        Assert.Contains("func clamp01(x)\n    if x < 0\n        ret 0\n    end\n", library);
+
+        KalkSession secondSession = CreateSession();
+        EvaluationResult result = await secondSession.EvaluateAsync("[clamp01(-2), clamp01(0.5), clamp01(3)]");
+
+        Assert.True(result.IsSuccess, $"{result.Error}\n--- library.kalk ---\n{File.ReadAllText(LibraryPath)}");
+        Assert.Empty(secondSession.LibraryLoadErrors);
+        Assert.Contains("out = [0, 0.5, 1]", result.Output);
+    }
+
+    [Theory]
+    [InlineData("1 + 2")]
+    [InlineData("func double(x)\n    ret x * 2\nend")]
+    [InlineData("")]
+    public void CheckSyntax_ValidText_HasNoProblem(string text)
+    {
+        Assert.Null(CreateSession().CheckSyntax(text));
+    }
+
+    [Theory]
+    [InlineData("1 +")]
+    [InlineData("func double(x)\n    ret x * 2")]
+    public void CheckSyntax_IncompleteText_ReportsAProblemInsideTheText(string text)
+    {
+        SyntaxProblem? problem = CreateSession().CheckSyntax(text);
+
+        Assert.NotNull(problem);
+        Assert.InRange(problem.Offset, 0, text.Length - 1);
+    }
+
+    [Fact]
     public async Task Documentation_IncludesFunctionsOfModulesNotImportedYet()
     {
         KalkSession session = CreateSession();

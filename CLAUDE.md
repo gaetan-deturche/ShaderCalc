@@ -30,6 +30,22 @@ created 2026-10-07. kalk is consumed **unmodified** as a git submodule (`externa
   completion list builder (rebuilt from `Builtins` / `Variables` / `Units` keys).
 - Scriban 6.3.0 (kalk's dependency) raises NuGet audit warnings (NU1902-1904). Not addressed yet.
 
+## Editor assist (input + library editors)
+
+`Ui/KalkEditorAssist` owns Enter, Ctrl+Enter, Tab, Ctrl+Space and F1 for an AvalonEdit editor. It's created
+before the window's own key handlers, so it gets those keys first. Only the 4 keys from this list are handled
+by the window: Up, Down, Esc.
+- Enter: a `func`/`if`/`for`/`while`/`case` header opens the block (inserting `end` if the text has unclosed
+  blocks), Enter inside a multi-line text adds a line, and the last line submits. Ctrl+Enter always submits.
+- Templates are AvalonEdit snippets (`Ui/KalkSnippets`). While one is active (`TextArea.StackedInputHandlers`
+  not empty) it handles Tab, Enter and Esc before the instance handlers. `IsBusy` covers it and the completion
+  window.
+- Live check: `KalkSession.CheckSyntax` (parse only, `TryEnter` on the engine lock), debounced 400 ms. It shows
+  as an amber hint plus a red underline (`KalkEditorHighlighting.SetError`). Evaluation errors are red.
+  Call `ResetSyntaxCheck` after a programmatic text change.
+- kalk prints `func` bodies flush left: `DescribeUserSymbol` re-indents them (`IndentBlocks`) for the editor
+  and library.kalk, and the Library list shows only the first line (`UserSymbol.Summary`).
+
 ## Persistent library (`~/.kalk/library.kalk`)
 
 - After every evaluation `KalkSession` diffs `engine.Variables` **by reference** (an assignment always stores
@@ -43,6 +59,11 @@ created 2026-10-07. kalk is consumed **unmodified** as a git submodule (`externa
   file verbatim, are listed as broken entries, and are fixed through `EvaluateAsync(text, replacesSymbol:
   <raw entry>)` or dropped with `DiscardBrokenEntry`.
 - Editing: `EvaluateAsync(text, replacesSymbol: name)`. If the text defines another name, the old one is deleted.
+- Outside edits apply live: a `FileSystemWatcher` (filter `library.kalk*`, which catches the `.tmp` rename KalkGui
+  saves with) is debounced 250 ms and then calls `ReloadLibraryAsync`. That method ignores text equal to
+  `_lastLibraryText` (KalkGui's own last write or read), skips entries matching the current definition
+  verbatim, re-evaluates the rest and removes library names no longer in the file. It doesn't rewrite the file.
+- Multi-line `func name(x) ... end` definitions round-trip (statement spans keep them whole).
 - Tests always pass a temp `kalkUserFolder`, so they never touch the real `~/.kalk`.
 
 ## Icon
@@ -68,6 +89,8 @@ Shared memory `no-focus-steal-gui-testing` has the rule and its history. The too
 - Scenarios: `smoke`, `calculator` (eval, display combo, errors, history, completion, cancel, clear),
   `panels` (docs, import menu, F1, library, config save + restart), `library` (persist, edit, rename,
   invalid edit + revert, restart, delete), `library-broken` (seeded broken entry: reported, kept, fixed in place),
+  `library-live` (outside edits of library.kalk applied live, New entry), `editor-help` (live check,
+  auto-close, Tab templates with mirrored parameter, completion, library templates),
   `publish-smoke` (the published exe). All pass as of 2026-10-07. `launch` takes `exe` and `library`
   (seed library.kalk) options.
 - App hooks for tests: `KALKGUI_DATA_DIR` (history) and `KALKGUI_KALK_FOLDER` (config.kalk) isolate runs

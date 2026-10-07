@@ -8,11 +8,19 @@ The kalk engine runs unmodified inside the app.
 - Input editor: Enter evaluates, Shift+Enter adds a new line, Tab / Ctrl+Space complete, Up/Down browse
   history, F1 opens the docs for the word under the caret, Esc cancels a long evaluation (and, from any other
   control, returns to the input).
+- Syntax help, in the input and in the Library editor:
+  - Enter after `func name(x)` / `if` / `for` / `while` opens the block and adds its `end`. Enter inside a
+    block adds a line, Enter on the last line evaluates, and Ctrl+Enter evaluates from anywhere.
+  - `func`, `if`, `for` or `while` followed by Tab expands to a template: Tab moves between the fields, and
+    the parameter name is mirrored into the body.
+  - The text is parsed as you type: the first syntax error is underlined and explained before you evaluate.
 - **Docs**: every documented function, including those in modules not imported yet.
 - **Library**: every variable and function you define is saved to `~/.kalk/library.kalk` (with the modules
-  it needs) and reloaded on every start. Select an entry to edit it in place; renaming replaces it. Entries
-  that fail to load stay in the file, flagged, until you fix or delete them. Definitions from `config.kalk`
-  are listed but stay in `config.kalk`.
+  it needs) and available immediately, now and on every later start. Select an entry to edit it in place
+  (renaming replaces it) or use New to add one from a template (variable, one-line function, multi-line
+  function). Edits made to `library.kalk` outside the app apply live.
+  Entries that fail to load stay in the file, flagged, until you fix or delete them. Definitions from
+  `config.kalk` are listed but stay in `config.kalk`.
 - **Config**: edit `~/.kalk/config.kalk`, save it and restart the engine.
 
 ## Build

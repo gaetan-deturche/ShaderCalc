@@ -35,8 +35,17 @@ public sealed record DocEntry(string Name, string Signature, string Group, strin
 public sealed record UserSymbol(string Name, bool IsFunction, string Definition, bool IsInLibrary, string? LoadError = null)
 {
     public bool IsBroken => LoadError != null;
+
+    /// <summary>One line for lists: a multi-line definition shows its first line.</summary>
+    public string Summary => Definition.Contains('\n') ? $"{Definition.ReplaceLineEndings("\n").Split('\n')[0]} …" : Definition;
 }
 
 public sealed record LibraryLoadError(string Entry, string Message);
+
+/// <summary>First parse error of a text; <see cref="Offset"/> is clamped inside the text.</summary>
+public sealed record SyntaxProblem(string Message, int Offset);
+
+/// <summary>What applying an outside edit of library.kalk changed in the session.</summary>
+public sealed record LibraryReloadResult(IReadOnlyList<string> UpdatedNames, IReadOnlyList<string> RemovedNames, IReadOnlyList<LibraryLoadError> Errors);
 
 public sealed record ModuleInfo(string Name, bool IsImported);

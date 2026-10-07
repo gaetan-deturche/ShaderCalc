@@ -10,9 +10,10 @@ using System.Windows.Data;
 using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Threading;
 using ICSharpCode.AvalonEdit;
-using ICSharpCode.AvalonEdit.CodeCompletion;
 using ICSharpCode.AvalonEdit.Document;
+using ICSharpCode.AvalonEdit.Snippets;
 using Kalk.Core;
 using KalkGui.Engine;
 using KalkGui.Ui;
@@ -37,7 +38,8 @@ public partial class MainWindow : Window
     private readonly FontFamily _monoFont;
     private readonly string? _kalkUserFolder;
     private KalkSession? _session;
-    private CompletionWindow? _completionWindow;
+    private readonly KalkEditorAssist _inputAssist;
+    private readonly KalkEditorAssist _libraryAssist;
     private ListCollectionView? _docView;
     private string _importedModules = string.Empty;
     private bool _isSyncingDisplayMode;
@@ -47,6 +49,9 @@ public partial class MainWindow : Window
     private bool _isLibraryEditDirty;
     private bool _isLoadingLibraryEditor;
     private bool _isRefreshingSymbols;
+    // Outside edits of library.kalk: watcher events are debounced (editors write in several steps)
+    private readonly DispatcherTimer _libraryReloadTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+    private FileSystemWatcher? _libraryWatcher;
     // Set from the evaluation thread by kalk's `clear` command
     private volatile bool _clearRequested;
 
@@ -66,10 +71,20 @@ public partial class MainWindow : Window
         _inputHighlighting = new KalkEditorHighlighting(InputEditor, () => _session, matchBraces: true);
         _configHighlighting = new KalkEditorHighlighting(ConfigEditor, () => _session, matchBraces: false);
         _libraryHighlighting = new KalkEditorHighlighting(LibraryEditor, () => _session, matchBraces: true);
+        // Created before the window's own key handlers: Enter/Tab/Ctrl+Space/F1 go to the assist first
+        _inputAssist = new KalkEditorAssist(InputEditor, _inputHighlighting, () => _session,
+            () => EvaluateAsync(InputEditor.Text, EvaluationSource.InputEditor), ShowDocumentation, problem => ShowSyntaxHint(ErrorText, problem));
+        _libraryAssist = new KalkEditorAssist(LibraryEditor, _libraryHighlighting, () => _session,
+            ApplyLibraryEditAsync, ShowDocumentation, problem => ShowSyntaxHint(LibraryErrorText, problem));
         InputEditor.TextArea.PreviewKeyDown += OnInputPreviewKeyDown;
         LibraryEditor.TextArea.PreviewKeyDown += OnLibraryEditorPreviewKeyDown;
         ConfigEditor.TextChanged += (_, _) => SetConfigDirty(true);
         LibraryEditor.TextChanged += (_, _) => _isLibraryEditDirty |= !_isLoadingLibraryEditor;
+        _libraryReloadTimer.Tick += async (_, _) =>
+        {
+            _libraryReloadTimer.Stop();
+            await ReloadLibraryFromDiskAsync();
+        };
 
         // --background: open behind the other windows without taking focus (UI automation, autostart)
         if (Environment.GetCommandLineArgs().Contains("--background", StringComparer.OrdinalIgnoreCase))
@@ -135,6 +150,7 @@ public partial class MainWindow : Window
                 SaveConfig();
             }
         }
+        _libraryWatcher?.Dispose();
         _session?.CancelEvaluation();
     }
 
@@ -152,12 +168,72 @@ public partial class MainWindow : Window
         {
             AppendNote($"# library.kalk: `{error.Entry}` was not loaded: {error.Message}", KalkPalette.Error);
         }
-        LibraryPathText.Text = $"Saved to {_session.LibraryFilePath} and reloaded on every start";
+        LibraryPathText.Text = $"Definitions apply immediately. Saved to {_session.LibraryFilePath}; outside edits are picked up live.";
+        WatchLibrary(_session.LibraryFilePath);
         _docView = null;
         RefreshPanels();
         _inputHighlighting.Refresh();
         _configHighlighting.Refresh();
         _libraryHighlighting.Refresh();
+    }
+
+    private void WatchLibrary(string? path)
+    {
+        _libraryWatcher?.Dispose();
+        _libraryWatcher = null;
+        if (path == null)
+        {
+            return;
+        }
+
+        string folder = Path.GetDirectoryName(path)!;
+        Directory.CreateDirectory(folder);
+        // "library.kalk*" also sees the .tmp rename KalkGui saves with; the session ignores its own writes
+        _libraryWatcher = new FileSystemWatcher(folder, Path.GetFileName(path) + "*")
+        {
+            NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size,
+        };
+        FileSystemEventHandler onFileEvent = (_, _) => Dispatcher.BeginInvoke(new Action(() =>
+        {
+            _libraryReloadTimer.Stop();
+            _libraryReloadTimer.Start();
+        }));
+        _libraryWatcher.Changed += onFileEvent;
+        _libraryWatcher.Created += onFileEvent;
+        _libraryWatcher.Deleted += onFileEvent;
+        _libraryWatcher.Renamed += (sender, e) => onFileEvent(sender, e);
+        _libraryWatcher.EnableRaisingEvents = true;
+    }
+
+    private async Task ReloadLibraryFromDiskAsync()
+    {
+        KalkSession? session = _session;
+        if (session == null)
+        {
+            return;
+        }
+
+        LibraryReloadResult? reload = await session.ReloadLibraryAsync();
+        if (reload == null || session != _session)
+        {
+            return;
+        }
+
+        List<string> changes = new List<string>();
+        if (reload.UpdatedNames.Count > 0)
+        {
+            changes.Add($"updated {string.Join(", ", reload.UpdatedNames)}");
+        }
+        if (reload.RemovedNames.Count > 0)
+        {
+            changes.Add($"removed {string.Join(", ", reload.RemovedNames)}");
+        }
+        AppendNote($"# library.kalk changed on disk: {(changes.Count > 0 ? string.Join("; ", changes) : "no definition changed")}");
+        foreach (LibraryLoadError error in reload.Errors)
+        {
+            AppendNote($"# library.kalk: `{error.Entry}` was not loaded: {error.Message}", KalkPalette.Error);
+        }
+        RefreshPanels();
     }
 
     private void RestartSession()
@@ -373,21 +449,17 @@ public partial class MainWindow : Window
 
     // ---- Input editor ----
 
-    private async void OnInputPreviewKeyDown(object sender, KeyEventArgs e)
+    // Enter, Tab, Ctrl+Space and F1 are handled by _inputAssist
+    private void OnInputPreviewKeyDown(object sender, KeyEventArgs e)
     {
-        // An open completion window handles its own keys (Enter/Tab commit, Esc closes)
-        if (_completionWindow != null)
+        // An open completion window or template handles its own keys
+        if (_inputAssist.IsBusy)
         {
             return;
         }
 
-        ModifierKeys modifiers = Keyboard.Modifiers;
         switch (e.Key)
         {
-            case Key.Enter when (modifiers & ModifierKeys.Shift) == 0:
-                e.Handled = true;
-                await EvaluateAsync(InputEditor.Text, EvaluationSource.InputEditor);
-                break;
             case Key.Up when InputEditor.TextArea.Caret.Line == 1:
                 if (_history.TryGetPrevious(InputEditor.Text, out string previous))
                 {
@@ -402,17 +474,6 @@ public partial class MainWindow : Window
                     e.Handled = true;
                 }
                 break;
-            case Key.Tab when modifiers == ModifierKeys.None:
-                e.Handled = TryOpenCompletion(isExplicitRequest: false);
-                break;
-            case Key.Space when modifiers == ModifierKeys.Control:
-                e.Handled = true;
-                TryOpenCompletion(isExplicitRequest: true);
-                break;
-            case Key.F1:
-                e.Handled = true;
-                ShowDocumentationAtCaret();
-                break;
             case Key.Escape when ErrorText.Visibility == Visibility.Visible:
                 HideError();
                 e.Handled = true;
@@ -426,69 +487,8 @@ public partial class MainWindow : Window
         FocusInput();
     }
 
-    private bool TryOpenCompletion(bool isExplicitRequest)
+    private void ShowDocumentation(string word)
     {
-        if (_session == null)
-        {
-            return false;
-        }
-
-        (int prefixStart, string prefix) = GetIdentifierBeforeCaret();
-        if (prefix.Length == 0 ? !isExplicitRequest : char.IsDigit(prefix[0]))
-        {
-            return false;
-        }
-
-        IReadOnlyList<CompletionItem> items = _session.GetCompletions(prefix);
-        if (items.Count == 0)
-        {
-            return false;
-        }
-        if (items.Count == 1 && !isExplicitRequest)
-        {
-            // A single match completes in place, like kalk's console Tab
-            InputEditor.Document.Replace(prefixStart, prefix.Length, items[0].Name);
-            return true;
-        }
-
-        CompletionWindow completionWindow = new CompletionWindow(InputEditor.TextArea) { StartOffset = prefixStart, MinWidth = 320 };
-        foreach (CompletionItem item in items)
-        {
-            completionWindow.CompletionList.CompletionData.Add(new KalkCompletionData(item));
-        }
-        completionWindow.Closed += (_, _) => _completionWindow = null;
-        _completionWindow = completionWindow;
-        completionWindow.Show();
-        if (prefix.Length > 0)
-        {
-            completionWindow.CompletionList.SelectItem(prefix);
-        }
-        return true;
-    }
-
-    private (int Start, string Identifier) GetIdentifierBeforeCaret()
-    {
-        string text = InputEditor.Text;
-        int caretOffset = InputEditor.CaretOffset;
-        int start = caretOffset;
-        while (start > 0 && (char.IsLetterOrDigit(text[start - 1]) || text[start - 1] == '_'))
-        {
-            start--;
-        }
-        return (start, text[start..caretOffset]);
-    }
-
-    private void ShowDocumentationAtCaret()
-    {
-        string text = InputEditor.Text;
-        int end = InputEditor.CaretOffset;
-        while (end < text.Length && (char.IsLetterOrDigit(text[end]) || text[end] == '_'))
-        {
-            end++;
-        }
-        (int start, _) = GetIdentifierBeforeCaret();
-        string word = text[start..end];
-
         SideTabs.SelectedItem = DocsTab;
         DocSearchBox.Text = string.Empty;
         DocEntry? entry = _docView?.OfType<DocEntry>().FirstOrDefault(candidate => candidate.Descriptor.Names.Contains(word));
@@ -518,12 +518,14 @@ public partial class MainWindow : Window
         if (source == EvaluationSource.LibraryEditor)
         {
             LibraryErrorText.Text = result.Error;
+            LibraryErrorText.Foreground = KalkPalette.Error;
             LibraryErrorText.Visibility = Visibility.Visible;
             return;
         }
 
         bool isFromInputEditor = source == EvaluationSource.InputEditor;
         ErrorText.Text = isFromInputEditor ? result.Error : $"{result.Input.Trim()}: {result.Error}";
+        ErrorText.Foreground = KalkPalette.Error;
         ErrorText.Visibility = Visibility.Visible;
 
         TextDocument document = InputEditor.Document;
@@ -537,6 +539,19 @@ public partial class MainWindow : Window
     private void HideError()
     {
         ErrorText.Visibility = Visibility.Collapsed;
+    }
+
+    /// <summary>Live parse result while typing: amber hint, or nothing once the text parses.</summary>
+    private static void ShowSyntaxHint(TextBlock target, SyntaxProblem? problem)
+    {
+        if (problem == null)
+        {
+            target.Visibility = Visibility.Collapsed;
+            return;
+        }
+        target.Text = problem.Message;
+        target.Foreground = KalkPalette.Warning;
+        target.Visibility = Visibility.Visible;
     }
 
     private void OnWindowPreviewKeyDown(object sender, KeyEventArgs e)
@@ -705,8 +720,10 @@ public partial class MainWindow : Window
         LibraryEditor.Text = symbol?.Definition ?? string.Empty;
         _isLoadingLibraryEditor = false;
         _isLibraryEditDirty = false;
+        _libraryAssist.ResetSyntaxCheck();
         // A broken entry shows why it did not load, so it can be fixed in place
         LibraryErrorText.Text = symbol?.LoadError ?? string.Empty;
+        LibraryErrorText.Foreground = KalkPalette.Error;
         LibraryErrorText.Visibility = symbol?.IsBroken == true ? Visibility.Visible : Visibility.Collapsed;
     }
 
@@ -722,14 +739,11 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void OnLibraryEditorPreviewKeyDown(object sender, KeyEventArgs e)
+    // Enter (apply), Tab, Ctrl+Space and F1 are handled by _libraryAssist
+    private void OnLibraryEditorPreviewKeyDown(object sender, KeyEventArgs e)
     {
-        if (e.Key == Key.Enter && (Keyboard.Modifiers & ModifierKeys.Shift) == 0)
-        {
-            e.Handled = true;
-            await ApplyLibraryEditAsync();
-        }
-        else if (e.Key == Key.Escape)
+        // Esc reverts an unapplied edit; with nothing to revert it bubbles up and returns to the input
+        if (e.Key == Key.Escape && !_libraryAssist.IsBusy && _isLibraryEditDirty)
         {
             e.Handled = true;
             LoadLibraryEditor(SelectedSymbol);
@@ -744,6 +758,37 @@ public partial class MainWindow : Window
     private void OnLibraryRevertClick(object sender, RoutedEventArgs e)
     {
         LoadLibraryEditor(SelectedSymbol);
+    }
+
+    private void OnLibraryNewClick(object sender, RoutedEventArgs e)
+    {
+        ContextMenu menu = new ContextMenu { PlacementTarget = (UIElement)sender, Placement = PlacementMode.Top };
+        AddNewEntryItem(menu, "Variable", KalkSnippets.Variable);
+        AddNewEntryItem(menu, "One-line function", KalkSnippets.OneLineFunction);
+        AddNewEntryItem(menu, "Multi-line function", KalkSnippets.MultiLineFunction);
+        menu.Items.Add(new Separator());
+        AddNewEntryItem(menu, "Empty", null);
+        menu.IsOpen = true;
+    }
+
+    private void AddNewEntryItem(ContextMenu menu, string header, Func<Snippet>? createTemplate)
+    {
+        MenuItem item = new MenuItem { Header = header };
+        item.Click += (_, _) =>
+        {
+            // Empty editor, no entry replaced: Apply adds whatever it defines
+            SymbolList.SelectedItem = null;
+            LoadLibraryEditor(null);
+            if (IsActive)
+            {
+                LibraryEditor.TextArea.Focus();
+            }
+            if (createTemplate != null)
+            {
+                _libraryAssist.InsertTemplate(createTemplate());
+            }
+        };
+        menu.Items.Add(item);
     }
 
     private void OnOpenLibraryClick(object sender, RoutedEventArgs e)
