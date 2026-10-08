@@ -25,8 +25,12 @@ public enum CompletionKind
 
 public sealed record CompletionItem(string Name, CompletionKind Kind, string? Description);
 
-/// <summary>A documented function, constant or module; <see cref="IsAvailable"/> is false until its module is imported.</summary>
-public sealed record DocEntry(string Name, string Signature, string Group, string Summary, string? ModuleName, bool IsAvailable, bool IsModule, KalkDescriptor Descriptor);
+/// <summary>
+/// A documented function, constant, module or language section; <see cref="IsAvailable"/> is false until its module
+/// is imported. Language sections carry their markdown in Descriptor.Description and their keywords in its Names.
+/// </summary>
+public sealed record DocEntry(string Name, string Signature, string Group, string Summary, string? ModuleName, bool IsAvailable, bool IsModule,
+    KalkDescriptor Descriptor, bool IsLanguage = false, string? Source = null);
 
 /// <summary>
 /// A user variable or function; <see cref="IsInLibrary"/> is false for config.kalk definitions. A library entry

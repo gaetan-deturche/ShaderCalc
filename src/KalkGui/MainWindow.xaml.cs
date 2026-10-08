@@ -41,6 +41,8 @@ public partial class MainWindow : Window
     private readonly KalkEditorAssist _inputAssist;
     private readonly KalkEditorAssist _libraryAssist;
     private ListCollectionView? _docView;
+    // Rank of each entry matching the docs search; null when the search box is empty
+    private Dictionary<DocEntry, int>? _docSearchScores;
     private string _importedModules = string.Empty;
     private bool _isSyncingDisplayMode;
     private bool _isConfigDirty;
@@ -491,7 +493,11 @@ public partial class MainWindow : Window
     {
         SideTabs.SelectedItem = DocsTab;
         DocSearchBox.Text = string.Empty;
-        DocEntry? entry = _docView?.OfType<DocEntry>().FirstOrDefault(candidate => candidate.Descriptor.Names.Contains(word));
+        // A function's own page beats the language section that merely mentions it (e.g. `float`)
+        DocEntry? entry = _docView?.OfType<DocEntry>()
+            .Where(candidate => candidate.Descriptor.Names.Contains(word, StringComparer.OrdinalIgnoreCase))
+            .OrderBy(candidate => candidate.IsLanguage)
+            .FirstOrDefault();
         if (entry != null)
         {
             DocList.SelectedItem = entry;
@@ -619,11 +625,10 @@ public partial class MainWindow : Window
     {
         string? selectedName = (DocList.SelectedItem as DocEntry)?.Name;
         List<DocEntry> entries = _session!.GetDocumentation().ToList();
-        ListCollectionView view = new ListCollectionView(entries);
-        view.GroupDescriptions.Add(new PropertyGroupDescription(nameof(DocEntry.Group)));
-        view.Filter = MatchesDocSearch;
+        ListCollectionView view = new ListCollectionView(entries) { Filter = MatchesDocSearch };
         _docView = view;
         DocList.ItemsSource = view;
+        ApplyDocSearch(selectBestMatch: false);
         DocList.SelectedItem = entries.FirstOrDefault(entry => entry.Name == selectedName);
         if (DocList.SelectedItem == null)
         {
@@ -631,23 +636,82 @@ public partial class MainWindow : Window
         }
     }
 
-    private bool MatchesDocSearch(object item)
+    /// <summary>No query: grouped by category. With a query: one list ranked by <see cref="DocSearch"/>.</summary>
+    private void ApplyDocSearch(bool selectBestMatch)
     {
-        string search = DocSearchBox.Text.Trim();
-        if (search.Length == 0)
+        if (_docView == null)
         {
-            return true;
+            return;
         }
 
-        DocEntry entry = (DocEntry)item;
-        return entry.Descriptor.Names.Any(name => name.Contains(search, StringComparison.OrdinalIgnoreCase))
-            || entry.Summary.Contains(search, StringComparison.OrdinalIgnoreCase)
-            || entry.Group.Contains(search, StringComparison.OrdinalIgnoreCase);
+        string query = DocSearchBox.Text.Trim();
+        _docSearchScores = null;
+        if (query.Length > 0)
+        {
+            _docSearchScores = new Dictionary<DocEntry, int>(ReferenceEqualityComparer.Instance);
+            foreach (DocEntry entry in _docView.SourceCollection.OfType<DocEntry>())
+            {
+                if (DocSearch.Score(entry, query) is int score)
+                {
+                    _docSearchScores[entry] = score;
+                }
+            }
+        }
+
+        using (_docView.DeferRefresh())
+        {
+            _docView.GroupDescriptions.Clear();
+            _docView.CustomSort = _docSearchScores == null ? null : new DocSearchComparer(_docSearchScores);
+            if (_docSearchScores == null)
+            {
+                _docView.GroupDescriptions.Add(new PropertyGroupDescription(nameof(DocEntry.Group)));
+            }
+        }
+        // The item template shows each result's category while searching
+        DocList.Tag = _docSearchScores == null ? null : "searching";
+
+        if (selectBestMatch && _docSearchScores != null && _docView.Count > 0)
+        {
+            DocList.SelectedIndex = 0;
+            DocList.ScrollIntoView(DocList.SelectedItem);
+        }
+    }
+
+    private bool MatchesDocSearch(object item)
+    {
+        return _docSearchScores == null || _docSearchScores.ContainsKey((DocEntry)item);
     }
 
     private void OnDocSearchChanged(object sender, TextChangedEventArgs e)
     {
-        _docView?.Refresh();
+        ApplyDocSearch(selectBestMatch: true);
+    }
+
+    /// <summary>Best score first; on a tie a function's own page before a language section, then shorter names.</summary>
+    private sealed class DocSearchComparer : System.Collections.IComparer
+    {
+        private readonly Dictionary<DocEntry, int> _scores;
+
+        public DocSearchComparer(Dictionary<DocEntry, int> scores)
+        {
+            _scores = scores;
+        }
+
+        public int Compare(object? x, object? y)
+        {
+            DocEntry left = (DocEntry)x!;
+            DocEntry right = (DocEntry)y!;
+            int order = _scores[left].CompareTo(_scores[right]);
+            if (order == 0)
+            {
+                order = left.IsLanguage.CompareTo(right.IsLanguage);
+            }
+            if (order == 0)
+            {
+                order = left.Name.Length.CompareTo(right.Name.Length);
+            }
+            return order != 0 ? order : string.Compare(left.Name, right.Name, StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     private void OnDocSelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -678,6 +742,22 @@ public partial class MainWindow : Window
         if (entry.IsModule)
         {
             InsertIntoInput(entry.Signature);
+            return;
+        }
+
+        if (entry.IsLanguage)
+        {
+            // Its first keyword: as a template when it opens a block (func, if, for, while)
+            string? keyword = entry.Descriptor.Names.Skip(1).FirstOrDefault();
+            if (keyword != null && KalkSnippets.ForKeyword(keyword) is Snippet template)
+            {
+                FocusInput();
+                _inputAssist.InsertTemplate(template);
+            }
+            else if (keyword != null)
+            {
+                InsertIntoInput(keyword);
+            }
             return;
         }
 

@@ -14,7 +14,10 @@ The kalk engine runs unmodified inside the app.
   - `func`, `if`, `for` or `while` followed by Tab expands to a template: Tab moves between the fields, and
     the parameter name is mirrored into the body.
   - The text is parsed as you type: the first syntax error is underlined and explained before you evaluate.
-- **Docs**: every documented function, including those in modules not imported yet.
+- **Docs**: every documented function, including those in modules not imported yet, plus a Language section
+  (keywords, operators, syntax). It comes from kalk's own guides, with a KalkGui supplement for what kalk leaves
+  undocumented (bitwise `&` `|` `<<` `>>`, the missing xor/`~`, `+=`/`++`, bit functions). Search ranks names and
+  keywords first, so `func`, `<<` or `??` find their section; F1 works on keywords and operators too.
 - **Library**: every variable and function you define is saved to `~/.kalk/library.kalk` (with the modules
   it needs) and available immediately, now and on every later start. Select an entry to edit it in place
   (renaming replaces it) or use New to add one from a template (variable, one-line function, multi-line

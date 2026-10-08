@@ -210,7 +210,7 @@ public sealed class KalkSession
         }, Array.Empty<CompletionItem>());
     }
 
-    /// <summary>Every documented symbol, including functions of modules not imported yet.</summary>
+    /// <summary>Language sections, then every documented symbol, including functions of modules not imported yet.</summary>
     public IReadOnlyList<DocEntry> GetDocumentation()
     {
         return ReadEngine<IReadOnlyList<DocEntry>>(() =>
@@ -245,6 +245,8 @@ public sealed class KalkSession
                 int groupOrder = string.Compare(left.Group, right.Group, StringComparison.OrdinalIgnoreCase);
                 return groupOrder != 0 ? groupOrder : string.Compare(left.Name, right.Name, StringComparison.OrdinalIgnoreCase);
             });
+            // Language sections first, in the guides' own teaching order
+            entries.InsertRange(0, LanguageDocs.All);
             return entries;
         }, Array.Empty<DocEntry>());
     }

@@ -235,6 +235,7 @@ internal sealed class KalkEditorAssist
         return (start, text[start..caretOffset]);
     }
 
+    /// <summary>The identifier at the caret, else the operator token there (`<<`, `|>`, `??`...).</summary>
     private string GetWordAtCaret()
     {
         string text = _editor.Text;
@@ -244,7 +245,26 @@ internal sealed class KalkEditorAssist
             end++;
         }
         (int start, _) = GetIdentifierBeforeCaret();
+        if (end > start)
+        {
+            return text[start..end];
+        }
+
+        start = end = _editor.CaretOffset;
+        while (start > 0 && IsOperatorCharacter(text[start - 1]))
+        {
+            start--;
+        }
+        while (end < text.Length && IsOperatorCharacter(text[end]))
+        {
+            end++;
+        }
         return text[start..end];
+    }
+
+    private static bool IsOperatorCharacter(char character)
+    {
+        return "<>=!&|^%*/+-?:.@$#;~".Contains(character);
     }
 
     private static bool IsIdentifierCharacter(char character)

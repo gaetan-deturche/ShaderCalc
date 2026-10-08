@@ -30,6 +30,21 @@ created 2026-10-07. kalk is consumed **unmodified** as a git submodule (`externa
   completion list builder (rebuilt from `Builtins` / `Variables` / `Units` keys).
 - Scriban 6.3.0 (kalk's dependency) raises NuGet audit warnings (NU1902-1904). Not addressed yet.
 
+## Language docs and search
+
+- `LanguageDocs` turns kalk's `site/doc/user/readme.md` (selected sections) and `syntax.md`, embedded straight from
+  the submodule, plus `src/KalkGui.Engine/Docs/supplement.md`, into one `DocEntry` per `###`/`####` section
+  (`IsLanguage`, markdown in `Descriptor.Description`). Keywords (search + F1) come from `KalkSectionKeywords`, or
+  from the supplement's `<!-- keywords: -->` comments.
+- The supplement covers what kalk doesn't document. `LanguageDocsTests.SupplementExamples_MatchKalk` runs every
+  supplement example, so a kalk update that changes behaviour fails the build. Facts it records: `&`/`|`
+  integers only, `^^` is a product not xor, no `~`/xor/`<<=`, `firstbithigh` = leading-zero count (unlike HLSL).
+- kalk's own examples are shown as written. 14/132 (`syntax.md`) and 8/29 (guide) differ from kalk 0.13 output,
+  mostly digit grouping, carried-over state, and `import Currencies` (broken upstream: its rates API needs a key).
+- `DocSearch.Score`: exact name/keyword 0, prefix 1, contains 2, title 3, summary 4, group 5, full text 6.
+  Every term must match. On ties the UI puts function pages before language sections. While searching the
+  list is flat and ranked (`DocSearchComparer`), and the best match is selected.
+
 ## Editor assist (input + library editors)
 
 `Ui/KalkEditorAssist` owns Enter, Ctrl+Enter, Tab, Ctrl+Space and F1 for an AvalonEdit editor. It's created
@@ -90,7 +105,8 @@ Shared memory `no-focus-steal-gui-testing` has the rule and its history. The too
   `panels` (docs, import menu, F1, library, config save + restart), `library` (persist, edit, rename,
   invalid edit + revert, restart, delete), `library-broken` (seeded broken entry: reported, kept, fixed in place),
   `library-live` (outside edits of library.kalk applied live, New entry), `editor-help` (live check,
-  auto-close, Tab templates with mirrored parameter, completion, library templates),
+  auto-close, Tab templates with mirrored parameter, completion, library templates), `docs-search` (ranked
+  search for keywords/operators, F1 on keywords and operators, Insert from a language page),
   `publish-smoke` (the published exe). All pass as of 2026-10-07. `launch` takes `exe` and `library`
   (seed library.kalk) options.
 - App hooks for tests: `KALKGUI_DATA_DIR` (history) and `KALKGUI_KALK_FOLDER` (config.kalk) isolate runs
