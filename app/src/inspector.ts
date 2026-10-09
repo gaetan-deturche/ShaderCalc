@@ -60,7 +60,9 @@ function buildProblem(diagnostic: Diagnostic): HTMLElement {
 function buildComponents(value: ValueInfo, reference: Reference | undefined): HTMLElement {
   const table: HTMLTableElement = element("table", "components");
   const referenceValue: ValueInfo | null =
-    reference?.verdict === "mismatch" || reference?.verdict === "withinTolerance" ? reference.referenceValue : null;
+    reference?.verdict === "mismatch" || reference?.verdict === "withinTolerance" || reference?.verdict === "warpLimit"
+      ? reference.referenceValue
+      : null;
   value.components.forEach((component: Component, index: number) => {
     const theirs: Component | undefined = referenceValue?.components[index];
     const differs: boolean = theirs !== undefined && theirs.raw !== component.raw;
@@ -106,6 +108,9 @@ function buildReference(reference: Reference | undefined): HTMLElement {
         ? `≠ WARP gives ${reference.referenceValue?.text}. The line uses approximate functions, which GPUs implement differently.`
         : `≠ WARP gives ${reference.referenceValue?.text}.`;
       className = "error";
+      break;
+    case "warpLimit":
+      [text, className] = [`⊘ WARP gives ${reference.referenceValue?.text}, but WARP is wrong here: ${reference.message ?? ""}.`, "warning"];
       break;
     default:
       [text, className] = [`Not checked: ${reference.message ?? ""}`, "dim"];

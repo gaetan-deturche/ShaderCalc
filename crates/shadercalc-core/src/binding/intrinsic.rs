@@ -1,3 +1,4 @@
+use crate::semantics::SemanticsProfile;
 use std::fmt;
 
 use crate::evaluation::intrinsic_context::IntrinsicContext;
@@ -31,7 +32,7 @@ impl IntrinsicSignature {
 /// A resolved signature, or why the arguments don't fit.
 pub type IntrinsicResolution = Result<IntrinsicSignature, String>;
 
-pub type IntrinsicResolver = Box<dyn Fn(&[ShaderType]) -> IntrinsicResolution + Send + Sync>;
+pub type IntrinsicResolver = Box<dyn Fn(&[ShaderType], &SemanticsProfile) -> IntrinsicResolution + Send + Sync>;
 
 /// Computes an intrinsic. Out arguments are written to the context's outputs.
 pub type IntrinsicImplementation = Box<dyn Fn(&IntrinsicContext, &[Value]) -> Value + Send + Sync>;

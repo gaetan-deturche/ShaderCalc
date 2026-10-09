@@ -18,16 +18,18 @@ asuint(n.x)
 Click a result (or put the caret on its line) to see its type, every component's bits, its units and the reference check.
 
 ## Reference check
-Every result also runs on a real HLSL compiler and GPU executor: DXC compiles the line (with the code it uses) to DXIL, and Direct3D 12's WARP adapter, the software GPU shipped with Windows, executes it. Literal arguments, variables and uniforms are fed through a buffer, so WARP really computes the line instead of DXC folding it.
+Every result also runs on a real HLSL compiler and GPU executor: DXC compiles the line (with the code it uses) to DXIL, and Direct3D 12's WARP adapter, the software GPU shipped with Windows, executes it. The line's literals, variables and uniforms are fed through a buffer, so WARP really computes the line instead of DXC folding it.
 
 | Mark | Meaning |
 |---|---|
 | `✓` | bit-identical |
 | `≈` | differs only through functions GPUs approximate (`sin`, `exp2`, `log2`...), within 64 ulp or 0.0008 |
 | `≠` | different: the inspector shows WARP's value |
+| `⊘` | different where WARP itself is wrong (`sinh`/`cosh`/`tanh`, `sin`/`cos`/`tan` beyond ±100π, `tan` near a pole): the inspector shows WARP's value and why |
+| `–` | not checked (DXC rejected the line, or WARP stopped on it) |
 | `…` | still running |
 
-The interpreter keeps the exact maths for approximate functions; a `≠` there shows how far one GPU implementation is from it (WARP's `asin(0)` is `6.76e-5`, its `tanh(100)` is NaN).
+The interpreter keeps the exact maths for approximate functions; a `≈` there shows how far one GPU implementation is from it (WARP's `asin(0)` is `6.76e-5`), and a `⊘` where WARP is simply wrong (its `tanh(7)` is 1.036).
 
 ## HLSL semantics
 The interpreter computes what DXC + WARP compute, including the places where they differ from plain IEEE or C code:
@@ -42,6 +44,18 @@ The interpreter computes what DXC + WARP compute, including the places where the
 - `min`/`max` with a NaN return the other operand.
 - `round` rounds halves to even; float to int truncates and saturates, NaN gives 0.
 
+## Slang CPU profile
+The profile switch in the toolbar picks the semantics. HLSL (DXC + WARP), the default, is what the rest of this reference describes. Slang CPU computes what Slang's C++ (CPU) target computes: the C library calls of its prelude and the default bodies of its core module.
+
+- C float rules: no flush to zero, `round` rounds halves away from zero (`roundf`), `mad` is fused (`fmaf`), `%` and `fmod` are C's exact `fmodf`, `f32tof16` rounds to nearest even.
+- Unsuffixed literals are typed: `1.5` is a float, `1` an int (int64_t when it doesn't fit), so `2147483647 + 1` wraps.
+- `half` is 16-bit: computed in float, stored rounded to nearest even.
+- Casts are C++ on x86-64: NaN and out-of-range values give INT_MIN, `uint` goes through int64. Shifts by the width or more and integer division by 0 are undefined (x86 traps on the division).
+- Functions are the C library's (`powf`, `expf`, `logf`, `log10f`, `exp2f`, `atan2` in double): `pow(-2, 3)` is -8. `min` and `max` are `fminf` and `fmaxf`.
+- Formulas from the core module: `normalize` is `x / length(x)`, `rsqrt` is `1 / sqrt(x)`, `frac` is `x - floor(x)` (it can reach 1), `smoothstep` is `t * t * (3 - (t + t))`, `degrees` is `x * (180 / pi)` in float, `sign(NaN)` is 1, `dot` and `mul` sum from 0, `D3DCOLORtoUBYTE4` scales by 255.001999.
+- Every float function also takes doubles (`sin(2.5L)`, the determinant of a double matrix).
+- There is no reference for this profile (the DXC + WARP check runs HLSL), so lines show `–`. Slang's slang-llvm build differs in one point: its fma is `a * b + c`.
+
 ## Literals and types
 - Unsuffixed literals are 64-bit (`literal int`, `literal float`) until they meet a type, as in DXC: `int(1 << 33)` is 0 but `int x = 1; x << 33` is 2.
 - `1u` uint, `1l` int64, `1ul` uint64, `1.0f` float, `1.0h` half, `1.0L` double. `010` is octal, `0x10` hex.
@@ -49,6 +63,9 @@ The interpreter computes what DXC + WARP compute, including the places where the
 - Scalars, vectors (`float3`, `vector<float, 3>`), matrices (`float3x3`, row by row), arrays, structs.
 - Swizzles: `.xyzw`, `.rgba`; matrix elements `._m01` (0-based) or `._12` (1-based).
 - HLSL 2021 rules: `&&`, `||` and `?:` need scalars; use `and()`, `or()` and `select()` for vectors.
+- DXC folds math on unsuffixed literals at compile time, in double and without flushing denormals: `float(1e-40)` keeps the denormal, and `-0.0 % 7` is `-0` (C's fmod).
+- A constructor needs exactly its component count: `float2(3.7)` is an error, the cast `(float2)3.7` repeats the value. A matrix and a vector convert only at the same size (`float2x2` and `float4`) or through a single row or column (`float1x3` to `float2`).
+- `%` doesn't take doubles: cast them to float first.
 
 ## Units
 A number followed by a unit is a unit literal in SI: `3 km`, `9.81 m/s^2`, `100 cd`, `2 m^-1`. The unit follows the value through every operation and function:
@@ -58,7 +75,15 @@ A number followed by a unit is a unit literal in SI: `3 km`, `9.81 m/s^2`, `100 
 - `sin`, `exp`, `log`, `saturate`... need a dimensionless value.
 - A mismatch is reported where it happens, inside the function, without stopping the evaluation.
 
-Known units: m km cm mm um nm, s ms us ns min h, kg g, A, K, mol, cd lm lx, N J W Hz, rad sr.
+Known units, with the SI prefixes where they apply (`km`, `µs` or `us`, `MHz`, `kPa`, `mL`):
+
+- SI: m s g A K mol cd, Hz N Pa J W C V F Ω (or ohm) S Wb T H lm lx Bq Gy Sv kat, rad sr.
+- With the SI: min h day, deg (π/180, so `cos(90 deg)` works), au, ha, L, t, Da, eV.
+- Information, counted in bytes: `B` and `b` (`1 b` is 0.125 B) with k M G… and Ki Mi Gi… (`16 MiB`).
+- US: in ft yd mi pica acre Tbsp tsp. Rendering: nit (cd/m²).
+- Long names and plurals too: `3 hours`, `5 feet`, `kilometer`.
+
+A name the code declares stays the variable: with `float t`, `3 m / t` divides by `t`, not by tonnes.
 
 ## C++ code
 Pasted C++ math works: `const T&` parameters are inputs, `T&` are inout, `std::` names are the HLSL intrinsics (`std::clamp`, `std::sqrt`), `static_cast<T>(x)`, `auto`, `inline`, `constexpr`, `namespace`, `using X = T;`, brace initialisation. `#include` lines are ignored.
@@ -176,19 +201,19 @@ DXC computes `exp2(log2(x) * y)`, so a negative `x` gives NaN: `pow(-2, 3)` is N
 <!-- group: Trigonometry -->
 ## sin
 `T sin(T x)` · float
-Sine (radians). Approximate: GPUs lose precision for large arguments (WARP gives 0 for `sin(1e30)`). Needs a dimensionless value.
+Sine (radians). Approximate. D3D specifies `sin` and `cos` (0.0008 absolute) only within ±100π: beyond, WARP drifts and gives 0 past about 2^24, so the reference shows `⊘`. Needs a dimensionless value.
 
 ## cos
 `T cos(T x)` · float
-Cosine (radians). Approximate.
+Cosine (radians). Approximate. Beyond ±100π WARP drifts and gives 1 past about 2^24 (`⊘`), as for `sin`.
 
 ## tan
 `T tan(T x)` · float
-Tangent. Approximate.
+Tangent. Approximate. Beyond ±100π, and near a pole (`|tan x|` ≥ 10) where small errors become large, WARP's result is flagged `⊘`.
 
 ## sincos
 `void sincos(T x, out T s, out T c)` · float
-Writes `sin(x)` and `cos(x)`.
+Writes `sin(x)` and `cos(x)`. Same limits as `sin` and `cos`.
 
 ## asin
 `T asin(T x)` · float
@@ -208,15 +233,15 @@ Angle of (x, y). DXC computes `atan(y / x)` and fixes the quadrant. Approximate.
 
 ## sinh
 `T sinh(T x)` · float
-Hyperbolic sine. Approximate (WARP stays finite where the exact value overflows).
+Hyperbolic sine. Approximate. WARP's hyperbolic functions are inaccurate (`sinh(7)` gives 528.4 instead of 548.3, and it stays finite where the exact value overflows), so the reference shows `⊘` when it differs.
 
 ## cosh
 `T cosh(T x)` · float
-Hyperbolic cosine. Approximate.
+Hyperbolic cosine. Approximate. WARP's is inaccurate (`cosh(7)` gives 509.8, less than its `sinh(7)`): `⊘`.
 
 ## tanh
 `T tanh(T x)` · float
-Hyperbolic tangent. Approximate: WARP returns NaN for large arguments where the exact value is 1.
+Hyperbolic tangent. Approximate. WARP's is inaccurate: `tanh(7)` gives 1.036, `tanh(100)` 9.1, and huge arguments give NaN: `⊘`.
 
 ## degrees
 `T degrees(T x)` · float

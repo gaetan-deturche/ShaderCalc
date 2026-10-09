@@ -33,14 +33,15 @@ struct StateArgument {
     active_tab: Option<String>,
     side_panel_width: f64,
     result_column_width: f64,
+    profile: String,
 }
 
 pub struct Backend {
     store: Mutex<WorksheetStore>,
     generation: AtomicU64,
     cancellation: Mutex<Arc<AtomicBool>>,
-    /// The latest evaluation, for its reference checks.
-    last: Mutex<Option<(u64, Arc<WorksheetResult>)>>,
+    /// The latest evaluation and its profile, for its reference checks.
+    last: Mutex<Option<(u64, Arc<WorksheetResult>, &'static SemanticsProfile)>>,
 }
 
 fn argument<'a, T: Deserialize<'a>>(arguments: &'a Json, name: &str) -> Result<T, String> {
@@ -94,6 +95,7 @@ impl Backend {
                 store.state.active_tab = state.active_tab;
                 store.state.side_panel_width = state.side_panel_width;
                 store.state.result_column_width = state.result_column_width;
+                store.state.profile = state.profile;
                 store.save_state().map_err(io_error)?;
                 Ok(Json::Null)
             }
@@ -116,7 +118,10 @@ impl Backend {
             }
             "evaluate" => {
                 let documents: Vec<DocumentArgument> = argument(arguments, "documents")?;
-                self.evaluate(documents)
+                let profile_id: String = argument(arguments, "profile")?;
+                let profile: &'static SemanticsProfile =
+                    SemanticsProfile::by_id(&profile_id).ok_or_else(|| format!("unknown profile '{profile_id}'"))?;
+                self.evaluate(documents, profile)
             }
             "checkReference" => {
                 let generation: u64 = argument(arguments, "generation")?;
@@ -134,7 +139,12 @@ impl Backend {
             "units" => {
                 let mut units: Vec<Json> = UNITS
                     .values()
-                    .map(|unit| json!({ "name": unit.name, "detail": format!("{} = {} {}", unit.name, unit.to_si, unit.dimension) }))
+                    .filter(|unit| unit.is_listed)
+                    .map(|unit| {
+                        let detail: String =
+                            format!("{}\n1 {} = {} {}", unit.description, unit.name, unit.to_si, unit.dimension);
+                        json!({ "name": unit.name, "detail": detail })
+                    })
                     .collect();
                 units.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
                 Ok(Json::Array(units))
@@ -157,11 +167,16 @@ impl Backend {
             "activeTab": store.state.active_tab,
             "sidePanelWidth": store.state.side_panel_width,
             "resultColumnWidth": store.state.result_column_width,
+            "profile": SemanticsProfile::by_id(&store.state.profile).unwrap_or(&SemanticsProfile::HLSL).id,
+            "profiles": SemanticsProfile::ALL
+                .iter()
+                .map(|profile| json!({ "id": profile.id, "label": profile.label, "hasReference": profile.has_reference() }))
+                .collect::<Vec<Json>>(),
         }))
     }
 
     /// Evaluates the worksheets; a newer evaluation cancels this one (the result is then `{ "cancelled": true }`).
-    fn evaluate(&self, documents: Vec<DocumentArgument>) -> Result<Json, String> {
+    fn evaluate(&self, documents: Vec<DocumentArgument>, profile: &'static SemanticsProfile) -> Result<Json, String> {
         let generation: u64 = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let cancellation: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         {
@@ -173,7 +188,7 @@ impl Backend {
             documents.into_iter().map(|document| WorksheetDocument::new(document.name, document.text)).collect();
         let options: EvaluationOptions =
             EvaluationOptions { cancellation: Some(cancellation), ..EvaluationOptions::default() };
-        let Ok(result) = worksheet::evaluate(&documents, &SemanticsProfile::HLSL, &options) else {
+        let Ok(result) = worksheet::evaluate(&documents, profile, &options) else {
             return Ok(json!({ "cancelled": true }));
         };
         if self.generation.load(Ordering::SeqCst) != generation {
@@ -201,20 +216,28 @@ impl Backend {
             diagnostics: result.diagnostics.iter().map(DiagnosticDto::from).collect(),
             symbols,
         };
-        *self.last.lock().expect("evaluation lock") = Some((generation, Arc::new(result)));
+        *self.last.lock().expect("evaluation lock") = Some((generation, Arc::new(result), profile));
         serde_json::to_value(evaluation).map_err(|error| error.to_string())
     }
 
     /// The reference check of one line of an evaluation; null when a newer evaluation replaced it.
     fn check_reference(&self, generation: u64, index: usize) -> Result<Json, String> {
-        let result: Arc<WorksheetResult> = match &*self.last.lock().expect("evaluation lock") {
-            Some((last, result)) if *last == generation => result.clone(),
-            _ => return Ok(Json::Null),
-        };
+        let (result, profile): (Arc<WorksheetResult>, &'static SemanticsProfile) =
+            match &*self.last.lock().expect("evaluation lock") {
+                Some((last, result, profile)) if *last == generation => (result.clone(), *profile),
+                _ => return Ok(Json::Null),
+            };
         let Some(line) = result.lines.get(index) else {
             return Err(format!("no line {index}"));
         };
-        let outcome = checker::check(&line.result, ReferenceMode::Strict);
+        let outcome = if profile.has_reference() {
+            checker::check(&line.result, ReferenceMode::Strict)
+        } else {
+            checker::not_checked(
+                format!("DXC + WARP check the HLSL profile only, not {}", profile.label),
+                String::new(),
+            )
+        };
         serde_json::to_value(ReferenceDto::from(&outcome)).map_err(|error| error.to_string())
     }
 }

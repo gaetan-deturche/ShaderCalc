@@ -10,7 +10,7 @@ use crate::binding::bound_tree::{BinaryOperator, UnaryOperator};
 use crate::binding::intrinsic::{Intrinsic, IntrinsicPrecision, IntrinsicResolution, IntrinsicSignature};
 use crate::binding::type_rules;
 use crate::diagnostics::DiagnosticSeverity;
-use crate::semantics::{RoundTies, SemanticsProfile};
+use crate::semantics::{Lowering, RoundTies, SemanticsProfile};
 use crate::syntax::tree::ParameterMode;
 use crate::types::{NumericType, ScalarKind, ShaderType};
 use crate::units::{Dimension, UnitTag};
@@ -100,13 +100,13 @@ pub fn names() -> impl Iterator<Item = &'static str> {
     table.intrinsics.iter().map(|intrinsic| intrinsic.name)
 }
 
-type Resolver = Box<dyn Fn(&[ShaderType]) -> IntrinsicResolution + Send + Sync>;
+type Resolver = Box<dyn Fn(&[ShaderType], &SemanticsProfile) -> IntrinsicResolution + Send + Sync>;
 
 fn add(
     table: &mut Vec<Intrinsic>,
     name: &'static str,
     precision: IntrinsicPrecision,
-    resolve: impl Fn(&[ShaderType]) -> IntrinsicResolution + Send + Sync + 'static,
+    resolve: impl Fn(&[ShaderType], &SemanticsProfile) -> IntrinsicResolution + Send + Sync + 'static,
     implementation: impl Fn(&IntrinsicContext, &[Value]) -> Value + Send + Sync + 'static,
 ) {
     table.push(Intrinsic {
@@ -118,16 +118,50 @@ fn add(
     });
 }
 
-fn add_transcendental(table: &mut Vec<Intrinsic>, name: &'static str, single: fn(f32) -> f32, wide: fn(f64) -> f64) {
+/// Notes where WARP's result can't be trusted, from a call's argument and result.
+type ReferenceLimit = fn(context: &IntrinsicContext, name: &str, argument: &Value, result: &Value);
+
+fn add_transcendental(
+    table: &mut Vec<Intrinsic>,
+    name: &'static str,
+    single: fn(f32) -> f32,
+    wide: fn(f64) -> f64,
+    limit: Option<ReferenceLimit>,
+) {
     add(table, name, IntrinsicPrecision::Approximate, same(1, KindClass::Float, None), move |context, arguments| {
-        map_float(
+        let result: Value = map_float(
             context,
             arguments,
             |math, operands| math.apply(single, wide, operands[0]),
             |units| context.units.dimensionless(units[0], name),
             None,
-        )
+        );
+        if let Some(limit) = limit {
+            limit(context, name, &arguments[0], &result);
+        }
+        result
     });
+}
+
+/// D3D specifies sin and cos (0.0008 absolute) only within ±100π; beyond, WARP's range reduction drifts, and it
+/// returns 0 (sin) or 1 (cos) past about 2^24.
+fn limit_trigonometry(context: &IntrinsicContext, name: &str, argument: &Value, _result: &Value) {
+    if (0..argument.bits.len()).any(|index| argument.get_number(index).abs() > 100.0 * std::f64::consts::PI) {
+        context.limit_reference(format!("{name} of |x| > 100π: D3D only specifies sin/cos within ±100π"));
+    }
+}
+
+/// tan as limit_trigonometry, and near a pole, where small errors in WARP's tan become large.
+fn limit_tangent(context: &IntrinsicContext, name: &str, argument: &Value, result: &Value) {
+    limit_trigonometry(context, name, argument, result);
+    if (0..result.bits.len()).any(|index| result.get_number(index).abs() >= 10.0) {
+        context.limit_reference("tan near a pole (|tan x| ≥ 10): small errors in WARP's tan become large".to_string());
+    }
+}
+
+/// WARP's hyperbolic functions are inaccurate (tanh(7) = 1.036, cosh(7) < sinh(7)).
+fn limit_hyperbolic(context: &IntrinsicContext, name: &str, _argument: &Value, _result: &Value) {
+    context.limit_reference(format!("{name}: WARP's sinh/cosh/tanh are inaccurate (tanh(7) gives 1.036)"));
 }
 
 fn bool_type(ty: NumericType) -> ShaderType {
@@ -179,7 +213,16 @@ fn build() -> Vec<Intrinsic> {
         )
     });
     add(t, "frac", Exact, same(1, KindClass::Float, None), |context, arguments| {
-        map_float(context, arguments, |math, operands| math.frc(operands[0]), keep, None)
+        map_float(
+            context,
+            arguments,
+            |math, operands| match context.profile.lowering {
+                Lowering::Dxc => math.frc(operands[0]),
+                Lowering::SlangCpu => math.subtract(operands[0], operands[0].floor()),
+            },
+            keep,
+            None,
+        )
     });
     add(t, "saturate", Exact, same(1, KindClass::FloatOrDouble, None), |context, arguments| {
         map_float(
@@ -203,7 +246,10 @@ fn build() -> Vec<Intrinsic> {
         map_float(
             context,
             arguments,
-            |math, operands| rsqrt(math, operands[0]),
+            |math, operands| match context.profile.lowering {
+                Lowering::Dxc => rsqrt(math, operands[0]),
+                Lowering::SlangCpu => math.divide(1.0, math.sqrt(operands[0])),
+            },
             |units| context.units.power(units[0], -0.5, "rsqrt"),
             None,
         )
@@ -218,29 +264,61 @@ fn build() -> Vec<Intrinsic> {
         )
     });
     add(t, "degrees", Exact, same(1, KindClass::Float, None), |context, arguments| {
-        map_float(context, arguments, |math, operands| math.multiply(operands[0], DEGREES_PER_RADIAN), keep, None)
+        map_float(
+            context,
+            arguments,
+            |math, operands| match context.profile.lowering {
+                Lowering::Dxc => math.multiply(operands[0], DEGREES_PER_RADIAN),
+                Lowering::SlangCpu => math.multiply(operands[0], math.divide(180.0, math.round(std::f64::consts::PI))),
+            },
+            keep,
+            None,
+        )
     });
     add(t, "radians", Exact, same(1, KindClass::Float, None), |context, arguments| {
-        map_float(context, arguments, |math, operands| math.multiply(operands[0], RADIANS_PER_DEGREE), keep, None)
+        map_float(
+            context,
+            arguments,
+            |math, operands| match context.profile.lowering {
+                Lowering::Dxc => math.multiply(operands[0], RADIANS_PER_DEGREE),
+                Lowering::SlangCpu => math.multiply(operands[0], math.divide(math.round(std::f64::consts::PI), 180.0)),
+            },
+            keep,
+            None,
+        )
     });
 
     // ---- Transcendentals: DXIL Exp/Log are base 2; WARP approximates them all ----
-    add_transcendental(t, "sin", f32::sin, f64::sin);
-    add_transcendental(t, "cos", f32::cos, f64::cos);
-    add_transcendental(t, "tan", f32::tan, f64::tan);
-    add_transcendental(t, "asin", f32::asin, f64::asin);
-    add_transcendental(t, "acos", f32::acos, f64::acos);
-    add_transcendental(t, "atan", f32::atan, f64::atan);
-    add_transcendental(t, "sinh", f32::sinh, f64::sinh);
-    add_transcendental(t, "cosh", f32::cosh, f64::cosh);
-    add_transcendental(t, "tanh", f32::tanh, f64::tanh);
-    add_transcendental(t, "exp2", exp2_single, exp2_wide);
-    add_transcendental(t, "log2", f32::log2, f64::log2);
+    add_transcendental(t, "sin", f32::sin, f64::sin, Some(limit_trigonometry));
+    add_transcendental(t, "cos", f32::cos, f64::cos, Some(limit_trigonometry));
+    add_transcendental(t, "tan", f32::tan, f64::tan, Some(limit_tangent));
+    add_transcendental(t, "asin", f32::asin, f64::asin, None);
+    add_transcendental(t, "acos", f32::acos, f64::acos, None);
+    add_transcendental(t, "atan", f32::atan, f64::atan, None);
+    add_transcendental(t, "sinh", f32::sinh, f64::sinh, Some(limit_hyperbolic));
+    add_transcendental(t, "cosh", f32::cosh, f64::cosh, Some(limit_hyperbolic));
+    add_transcendental(t, "tanh", f32::tanh, f64::tanh, Some(limit_hyperbolic));
+    add(t, "exp2", Approximate, same(1, KindClass::Float, None), |context, arguments| {
+        map_float(
+            context,
+            arguments,
+            |math, operands| match context.profile.lowering {
+                Lowering::Dxc => exp2(math, operands[0]),
+                Lowering::SlangCpu => math.apply(f32::exp2, f64::exp2, operands[0]),
+            },
+            |units| context.units.dimensionless(units[0], "exp2"),
+            None,
+        )
+    });
+    add_transcendental(t, "log2", f32::log2, f64::log2, None);
     add(t, "exp", Approximate, same(1, KindClass::Float, None), |context, arguments| {
         map_float(
             context,
             arguments,
-            |math, operands| exp2(math, math.multiply(operands[0], LOG2_OF_E)),
+            |math, operands| match context.profile.lowering {
+                Lowering::Dxc => exp2(math, math.multiply(operands[0], LOG2_OF_E)),
+                Lowering::SlangCpu => math.apply(f32::exp, f64::exp, operands[0]),
+            },
             |units| context.units.dimensionless(units[0], "exp"),
             None,
         )
@@ -249,7 +327,10 @@ fn build() -> Vec<Intrinsic> {
         map_float(
             context,
             arguments,
-            |math, operands| math.multiply(log2(math, operands[0]), LN_OF_2),
+            |math, operands| match context.profile.lowering {
+                Lowering::Dxc => math.multiply(log2(math, operands[0]), LN_OF_2),
+                Lowering::SlangCpu => math.apply(f32::ln, f64::ln, operands[0]),
+            },
             |units| context.units.dimensionless(units[0], "log"),
             None,
         )
@@ -258,7 +339,10 @@ fn build() -> Vec<Intrinsic> {
         map_float(
             context,
             arguments,
-            |math, operands| math.multiply(log2(math, operands[0]), LOG10_OF_2),
+            |math, operands| match context.profile.lowering {
+                Lowering::Dxc => math.multiply(log2(math, operands[0]), LOG10_OF_2),
+                Lowering::SlangCpu => math.apply(f32::log10, f64::log10, operands[0]),
+            },
             |units| context.units.dimensionless(units[0], "log10"),
             None,
         )
@@ -269,7 +353,10 @@ fn build() -> Vec<Intrinsic> {
         map_float(
             context,
             arguments,
-            |math, operands| math.multiply(exp2(math, operands[1]), operands[0]),
+            |math, operands| match context.profile.lowering {
+                Lowering::Dxc => math.multiply(exp2(math, operands[1]), operands[0]),
+                Lowering::SlangCpu => math.multiply(operands[0], math.apply(f32::exp2, f64::exp2, operands[1])),
+            },
             |units| {
                 context.units.dimensionless(units[1], "ldexp's exponent");
                 units[0]
@@ -281,7 +368,10 @@ fn build() -> Vec<Intrinsic> {
         map_float(
             context,
             arguments,
-            |math, operands| atan2(math, operands[0], operands[1]),
+            |math, operands| match context.profile.lowering {
+                Lowering::Dxc => atan2(math, operands[0], operands[1]),
+                Lowering::SlangCpu => math.round(operands[0].atan2(operands[1])),
+            },
             |units| UnitTag {
                 dimension: Dimension::NONE,
                 is_adoptable: context.units.same(units[0], units[1], "atan2").is_adoptable,
@@ -295,6 +385,7 @@ fn build() -> Vec<Intrinsic> {
         Approximate,
         outputs_like(KindClass::Float, vec![ParameterMode::In, ParameterMode::Out, ParameterMode::Out]),
         |context, arguments| {
+            limit_trigonometry(context, "sincos", &arguments[0], &arguments[0]);
             let units = |tags: &[UnitTag]| context.units.dimensionless(tags[0], "sincos");
             let sine: Value = map_float(
                 context,
@@ -321,7 +412,10 @@ fn build() -> Vec<Intrinsic> {
         map_float(
             context,
             arguments,
-            |math, operands| fmod(math, operands[0], operands[1]),
+            |math, operands| match context.profile.lowering {
+                Lowering::Dxc => fmod(math, operands[0], operands[1]),
+                Lowering::SlangCpu => math.round(operands[0] % operands[1]),
+            },
             |units| context.units.same(units[0], units[1], "fmod"),
             None,
         )
@@ -343,11 +437,20 @@ fn build() -> Vec<Intrinsic> {
             context,
             arguments,
             |math, operands| {
-                // t * (t * (3 - t * 2)), as DXC lowers it without fast math
-                let ratio: f64 = FloatOps::saturate(
-                    math.divide(math.subtract(operands[2], operands[0]), math.subtract(operands[1], operands[0])),
-                );
-                math.multiply(ratio, math.multiply(ratio, math.subtract(3.0, math.multiply(ratio, 2.0))))
+                let quotient: f64 =
+                    math.divide(math.subtract(operands[2], operands[0]), math.subtract(operands[1], operands[0]));
+                match context.profile.lowering {
+                    // t * (t * (3 - t * 2)), as DXC lowers it without fast math
+                    Lowering::Dxc => {
+                        let ratio: f64 = FloatOps::saturate(quotient);
+                        math.multiply(ratio, math.multiply(ratio, math.subtract(3.0, math.multiply(ratio, 2.0))))
+                    }
+                    // saturate is clamp(x, 0, 1) = fminf(fmaxf(x, 0), 1)
+                    Lowering::SlangCpu => {
+                        let ratio: f64 = FloatOps::min(FloatOps::max(quotient, 0.0), 1.0);
+                        math.multiply(math.multiply(ratio, ratio), math.subtract(3.0, math.add(ratio, ratio)))
+                    }
+                }
             },
             |units| {
                 context.units.same(units[0], units[1], "smoothstep");
@@ -427,7 +530,11 @@ fn build() -> Vec<Intrinsic> {
             map_float(
                 context,
                 &arguments[..1],
-                |math, operands| math.subtract(operands[0], operands[0].trunc()),
+                |math, operands| match context.profile.lowering {
+                    Lowering::Dxc => math.subtract(operands[0], operands[0].trunc()),
+                    Lowering::SlangCpu if operands[0].is_infinite() => 0.0f64.copysign(operands[0]),
+                    Lowering::SlangCpu => math.subtract(operands[0], operands[0].trunc()).copysign(operands[0]),
+                },
                 keep,
                 None,
             )
@@ -436,11 +543,11 @@ fn build() -> Vec<Intrinsic> {
     add(t, "frexp", Exact, outputs_like(KindClass::Float, vec![ParameterMode::In, ParameterMode::Out]), frexp);
 
     // ---- Logic ----
-    add(t, "any", Exact, reduce(KindClass::Any, ScalarKind::Bool), |_, arguments| {
-        Value::from_bool((0..arguments[0].bits.len()).any(|index| arguments[0].get_bool(index)))
+    add(t, "any", Exact, reduce(KindClass::Any, ScalarKind::Bool), |context, arguments| {
+        Value::from_bool((0..arguments[0].bits.len()).any(|index| arguments[0].get_bool(index, context.profile)))
     });
-    add(t, "all", Exact, reduce(KindClass::Any, ScalarKind::Bool), |_, arguments| {
-        Value::from_bool((0..arguments[0].bits.len()).all(|index| arguments[0].get_bool(index)))
+    add(t, "all", Exact, reduce(KindClass::Any, ScalarKind::Bool), |context, arguments| {
+        Value::from_bool((0..arguments[0].bits.len()).all(|index| arguments[0].get_bool(index, context.profile)))
     });
     add(t, "and", Exact, same(2, KindClass::Any, Some(bool_type)), |context, arguments| {
         map_bits(
@@ -448,7 +555,10 @@ fn build() -> Vec<Intrinsic> {
             result_kind(arguments, ScalarKind::Bool),
             arguments,
             |bits, kinds| {
-                scalars::from_bool(scalars::is_true(kinds[0], bits[0]) && scalars::is_true(kinds[1], bits[1]))
+                scalars::from_bool(
+                    scalars::is_true(kinds[0], bits[0], context.profile)
+                        && scalars::is_true(kinds[1], bits[1], context.profile),
+                )
             },
             drop_silently,
         )
@@ -459,7 +569,10 @@ fn build() -> Vec<Intrinsic> {
             result_kind(arguments, ScalarKind::Bool),
             arguments,
             |bits, kinds| {
-                scalars::from_bool(scalars::is_true(kinds[0], bits[0]) || scalars::is_true(kinds[1], bits[1]))
+                scalars::from_bool(
+                    scalars::is_true(kinds[0], bits[0], context.profile)
+                        || scalars::is_true(kinds[1], bits[1], context.profile),
+                )
             },
             drop_silently,
         )
@@ -469,7 +582,7 @@ fn build() -> Vec<Intrinsic> {
             context,
             arguments[1].ty.clone(),
             arguments,
-            |bits, kinds| if scalars::is_true(kinds[0], bits[0]) { bits[1] } else { bits[2] },
+            |bits, kinds| if scalars::is_true(kinds[0], bits[0], context.profile) { bits[1] } else { bits[2] },
             |units| context.units.same(units[1], units[2], "select"),
         )
     });
@@ -482,10 +595,10 @@ fn build() -> Vec<Intrinsic> {
         let difference: Value = subtract(context, &arguments[0], &arguments[1]);
         length(context, &difference)
     });
-    add(t, "normalize", Approximate, same(1, KindClass::Float, None), normalize);
-    add(t, "reflect", Exact, same(2, KindClass::Float, None), reflect);
-    add(t, "refract", Exact, resolve_refract, refract);
-    add(t, "faceforward", Exact, same(3, KindClass::Float, None), face_forward);
+    add(t, "normalize", Approximate, vectors_only(same(1, KindClass::Float, None)), normalize);
+    add(t, "reflect", Exact, vectors_only(same(2, KindClass::Float, None)), reflect);
+    add(t, "refract", Exact, vectors_only(Box::new(resolve_refract)), refract);
+    add(t, "faceforward", Exact, vectors_only(same(3, KindClass::Float, None)), face_forward);
     add(t, "mul", Exact, resolve_mul, mul);
     add(t, "transpose", Exact, resolve_transpose, transpose);
     add(t, "determinant", Exact, resolve_determinant, determinant);
@@ -573,7 +686,10 @@ fn build() -> Vec<Intrinsic> {
             context,
             result_kind(arguments, ScalarKind::Float),
             arguments,
-            |bits, _| scalars::from_float(f16::from_bits(bits[0] as u16).to_f32()),
+            |bits, _| match context.profile.lowering {
+                Lowering::Dxc => scalars::from_float(f16::from_bits(bits[0] as u16).to_f32()),
+                Lowering::SlangCpu => scalars::from_float(scalars::half_to_float(bits[0] as u32 & 0xFFFF)),
+            },
             drop_silently,
         )
     });
@@ -590,12 +706,12 @@ fn fail(message: impl Into<String>) -> IntrinsicResolution {
 
 /// All arguments share one type T (scalars splat to the vector/matrix shape); returns T unless told otherwise.
 fn same(arity: usize, kind_class: KindClass, returns: Option<fn(NumericType) -> ShaderType>) -> Resolver {
-    Box::new(move |arguments: &[ShaderType]| {
+    Box::new(move |arguments: &[ShaderType], profile: &SemanticsProfile| {
         if arguments.len() != arity {
             let plural: &str = if arity == 1 { "" } else { "s" };
             return fail(format!("takes {} argument{}, got {}", arity, plural, arguments.len()));
         }
-        let common: NumericType = try_common_type(arguments, kind_class)?;
+        let common: NumericType = try_common_type(arguments, kind_class, profile)?;
         let return_type: ShaderType = match returns {
             Some(returns) => returns(common),
             None => common.into(),
@@ -606,27 +722,31 @@ fn same(arity: usize, kind_class: KindClass, returns: Option<fn(NumericType) -> 
 
 /// sincos(x, out s, out c), modf(x, out ip), frexp(x, out e): every parameter has x's type.
 fn outputs_like(kind_class: KindClass, modes: Vec<ParameterMode>) -> Resolver {
-    Box::new(move |arguments: &[ShaderType]| {
+    Box::new(move |arguments: &[ShaderType], profile: &SemanticsProfile| {
         if arguments.len() != modes.len() {
             return fail(format!("takes {} arguments, got {}", modes.len(), arguments.len()));
         }
-        let common: NumericType = try_common_type(&arguments[..1], kind_class)?;
+        let common: NumericType = try_common_type(&arguments[..1], kind_class, profile)?;
         let return_type: ShaderType = if modes.len() == 3 { ShaderType::Void } else { common.into() };
         Ok(IntrinsicSignature { parameter_types: vec![common.into(); modes.len()], modes: modes.clone(), return_type })
     })
 }
 
 fn reduce(kind_class: KindClass, result_kind: ScalarKind) -> Resolver {
-    Box::new(move |arguments: &[ShaderType]| {
+    Box::new(move |arguments: &[ShaderType], profile: &SemanticsProfile| {
         if arguments.len() != 1 {
             return fail(format!("takes 1 argument, got {}", arguments.len()));
         }
-        let common: NumericType = try_common_type(arguments, kind_class)?;
+        let common: NumericType = try_common_type(arguments, kind_class, profile)?;
         Ok(IntrinsicSignature::all_in(vec![common.into()], ShaderType::scalar(result_kind)))
     })
 }
 
-fn try_common_type(arguments: &[ShaderType], kind_class: KindClass) -> Result<NumericType, String> {
+fn try_common_type(
+    arguments: &[ShaderType],
+    kind_class: KindClass,
+    profile: &SemanticsProfile,
+) -> Result<NumericType, String> {
     let mut result: Option<NumericType> = None;
     for argument in arguments {
         let ShaderType::Numeric(numeric) = argument else {
@@ -669,7 +789,8 @@ fn try_common_type(arguments: &[ShaderType], kind_class: KindClass) -> Result<Nu
         }
         KindClass::Any => result.kind.materialized(),
     };
-    if kind_class == KindClass::Float && adjusted == ScalarKind::Double {
+    // DXIL has no double version of most float ops; Slang's CPU prelude has them all (F64_sin...)
+    if kind_class == KindClass::Float && adjusted == ScalarKind::Double && profile.lowering == Lowering::Dxc {
         return Err("doesn't support double (no DXIL instruction for it)".to_string());
     }
     if kind_class == KindClass::Integer && !adjusted.is_integer() {
@@ -683,8 +804,8 @@ fn try_common_type(arguments: &[ShaderType], kind_class: KindClass) -> Result<Nu
 
 fn resolve_double_only(arity: usize) -> Resolver {
     let resolve: Resolver = same(arity, KindClass::FloatOrDouble, None);
-    Box::new(move |arguments: &[ShaderType]| {
-        let resolution: IntrinsicResolution = resolve(arguments);
+    Box::new(move |arguments: &[ShaderType], profile: &SemanticsProfile| {
+        let resolution: IntrinsicResolution = resolve(arguments, profile);
         match &resolution {
             Ok(signature) if matches!(&signature.return_type, ShaderType::Numeric(numeric) if numeric.kind == ScalarKind::Double) => {
                 resolution
@@ -694,11 +815,11 @@ fn resolve_double_only(arity: usize) -> Resolver {
     })
 }
 
-fn resolve_select(arguments: &[ShaderType]) -> IntrinsicResolution {
+fn resolve_select(arguments: &[ShaderType], profile: &SemanticsProfile) -> IntrinsicResolution {
     if arguments.len() != 3 {
         return fail(format!("takes 3 arguments, got {}", arguments.len()));
     }
-    let values: NumericType = try_common_type(&arguments[1..], KindClass::Any)?;
+    let values: NumericType = try_common_type(&arguments[1..], KindClass::Any, profile)?;
     let ShaderType::Numeric(condition) = &arguments[0] else {
         return fail(format!("needs a bool condition, got {}", arguments[0]));
     };
@@ -718,19 +839,29 @@ fn resolve_select(arguments: &[ShaderType]) -> IntrinsicResolution {
     ))
 }
 
-fn resolve_dot(arguments: &[ShaderType]) -> IntrinsicResolution {
+/// Geometric intrinsics have no matrix overload in DXC.
+fn vectors_only(resolve: Resolver) -> Resolver {
+    Box::new(move |arguments: &[ShaderType], profile: &SemanticsProfile| {
+        if arguments.iter().any(|argument| matches!(argument, ShaderType::Numeric(numeric) if numeric.is_matrix())) {
+            return fail("needs vectors, got a matrix");
+        }
+        resolve(arguments, profile)
+    })
+}
+
+fn resolve_dot(arguments: &[ShaderType], profile: &SemanticsProfile) -> IntrinsicResolution {
     if arguments.len() != 2 {
         return fail(format!("takes 2 arguments, got {}", arguments.len()));
     }
-    let common: NumericType = try_common_type(arguments, KindClass::Numeric)?;
+    let common: NumericType = try_common_type(arguments, KindClass::Numeric, profile)?;
     if common.is_matrix() {
         return fail("needs vectors, got a matrix");
     }
     Ok(IntrinsicSignature::all_in(vec![common.into(), common.into()], ShaderType::scalar(common.kind)))
 }
 
-fn resolve_cross(arguments: &[ShaderType]) -> IntrinsicResolution {
-    let resolution: IntrinsicResolution = same(2, KindClass::Float, None)(arguments);
+fn resolve_cross(arguments: &[ShaderType], profile: &SemanticsProfile) -> IntrinsicResolution {
+    let resolution: IntrinsicResolution = same(2, KindClass::Float, None)(arguments, profile);
     match &resolution {
         Err(_) => resolution,
         Ok(signature) if matches!(&signature.return_type, ShaderType::Numeric(numeric) if numeric.is_vector() && numeric.size() == 3) => {
@@ -742,8 +873,8 @@ fn resolve_cross(arguments: &[ShaderType]) -> IntrinsicResolution {
 
 fn resolve_length(arity: usize) -> Resolver {
     let resolve: Resolver = same(arity, KindClass::Float, None);
-    Box::new(move |arguments: &[ShaderType]| {
-        let signature: IntrinsicSignature = resolve(arguments)?;
+    Box::new(move |arguments: &[ShaderType], profile: &SemanticsProfile| {
+        let signature: IntrinsicSignature = resolve(arguments, profile)?;
         let ShaderType::Numeric(common) = signature.return_type else {
             return fail("needs vectors");
         };
@@ -754,15 +885,15 @@ fn resolve_length(arity: usize) -> Resolver {
     })
 }
 
-fn resolve_refract(arguments: &[ShaderType]) -> IntrinsicResolution {
+fn resolve_refract(arguments: &[ShaderType], profile: &SemanticsProfile) -> IntrinsicResolution {
     if arguments.len() != 3 {
         return fail(format!("takes 3 arguments, got {}", arguments.len()));
     }
-    let common: NumericType = try_common_type(&arguments[..2], KindClass::Float)?;
+    let common: NumericType = try_common_type(&arguments[..2], KindClass::Float, profile)?;
     Ok(IntrinsicSignature::all_in(vec![common.into(), common.into(), ShaderType::scalar(common.kind)], common.into()))
 }
 
-fn resolve_mul(arguments: &[ShaderType]) -> IntrinsicResolution {
+fn resolve_mul(arguments: &[ShaderType], _profile: &SemanticsProfile) -> IntrinsicResolution {
     if arguments.len() != 2 {
         return fail(format!("takes 2 arguments, got {}", arguments.len()));
     }
@@ -795,7 +926,7 @@ fn resolve_mul(arguments: &[ShaderType]) -> IntrinsicResolution {
     Ok(IntrinsicSignature::all_in(vec![left_type.into(), right_type.into()], result))
 }
 
-fn resolve_transpose(arguments: &[ShaderType]) -> IntrinsicResolution {
+fn resolve_transpose(arguments: &[ShaderType], _profile: &SemanticsProfile) -> IntrinsicResolution {
     match arguments {
         [ShaderType::Numeric(matrix)] if matrix.is_matrix() => {
             let materialized: NumericType = matrix.with_kind(matrix.kind.materialized());
@@ -808,9 +939,12 @@ fn resolve_transpose(arguments: &[ShaderType]) -> IntrinsicResolution {
     }
 }
 
-fn resolve_determinant(arguments: &[ShaderType]) -> IntrinsicResolution {
+fn resolve_determinant(arguments: &[ShaderType], profile: &SemanticsProfile) -> IntrinsicResolution {
     match arguments {
         [ShaderType::Numeric(matrix)] if matrix.is_matrix() && matrix.rows == matrix.columns => {
+            if matrix.kind == ScalarKind::Double && profile.lowering == Lowering::SlangCpu {
+                return Ok(IntrinsicSignature::all_in(vec![(*matrix).into()], ShaderType::scalar(ScalarKind::Double)));
+            }
             if matrix.kind == ScalarKind::Double {
                 return fail("doesn't support double");
             }
@@ -820,7 +954,7 @@ fn resolve_determinant(arguments: &[ShaderType]) -> IntrinsicResolution {
     }
 }
 
-fn resolve_lit(arguments: &[ShaderType]) -> IntrinsicResolution {
+fn resolve_lit(arguments: &[ShaderType], _profile: &SemanticsProfile) -> IntrinsicResolution {
     if arguments.len() == 3 && arguments.iter().all(ShaderType::is_scalar) {
         Ok(IntrinsicSignature::all_in(
             vec![ShaderType::float(), ShaderType::float(), ShaderType::float()],
@@ -831,7 +965,7 @@ fn resolve_lit(arguments: &[ShaderType]) -> IntrinsicResolution {
     }
 }
 
-fn resolve_dst(arguments: &[ShaderType]) -> IntrinsicResolution {
+fn resolve_dst(arguments: &[ShaderType], _profile: &SemanticsProfile) -> IntrinsicResolution {
     let float4: ShaderType = ShaderType::vector(ScalarKind::Float, 4);
     if arguments.len() == 2 {
         Ok(IntrinsicSignature::all_in(vec![float4.clone(), float4.clone()], float4))
@@ -841,7 +975,7 @@ fn resolve_dst(arguments: &[ShaderType]) -> IntrinsicResolution {
 }
 
 fn resolve_reinterpret(target: ScalarKind) -> Resolver {
-    Box::new(move |arguments: &[ShaderType]| reinterpret_signature(arguments, target))
+    Box::new(move |arguments: &[ShaderType], _profile: &SemanticsProfile| reinterpret_signature(arguments, target))
 }
 
 fn reinterpret_signature(arguments: &[ShaderType], target: ScalarKind) -> IntrinsicResolution {
@@ -856,7 +990,7 @@ fn reinterpret_signature(arguments: &[ShaderType], target: ScalarKind) -> Intrin
     Ok(IntrinsicSignature::all_in(vec![source.into()], source.with_kind(target).into()))
 }
 
-fn resolve_as_uint(arguments: &[ShaderType]) -> IntrinsicResolution {
+fn resolve_as_uint(arguments: &[ShaderType], _profile: &SemanticsProfile) -> IntrinsicResolution {
     if arguments.len() == 3 {
         // asuint(double value, out uint low, out uint high)
         let ShaderType::Numeric(value) = &arguments[0] else {
@@ -875,18 +1009,18 @@ fn resolve_as_uint(arguments: &[ShaderType]) -> IntrinsicResolution {
     reinterpret_signature(arguments, ScalarKind::UInt)
 }
 
-fn resolve_as_double(arguments: &[ShaderType]) -> IntrinsicResolution {
+fn resolve_as_double(arguments: &[ShaderType], profile: &SemanticsProfile) -> IntrinsicResolution {
     if arguments.len() != 2 {
         return fail("takes two uints (low, high)");
     }
-    let Ok(common) = try_common_type(arguments, KindClass::Integer) else {
+    let Ok(common) = try_common_type(arguments, KindClass::Integer, profile) else {
         return fail("takes two uints (low, high)");
     };
     let words: NumericType = common.with_kind(ScalarKind::UInt);
     Ok(IntrinsicSignature::all_in(vec![words.into(), words.into()], words.with_kind(ScalarKind::Double).into()))
 }
 
-fn resolve_f16_to_f32(arguments: &[ShaderType]) -> IntrinsicResolution {
+fn resolve_f16_to_f32(arguments: &[ShaderType], _profile: &SemanticsProfile) -> IntrinsicResolution {
     let [ShaderType::Numeric(numeric)] = arguments else {
         return fail("takes one uint");
     };
@@ -894,7 +1028,7 @@ fn resolve_f16_to_f32(arguments: &[ShaderType]) -> IntrinsicResolution {
     Ok(IntrinsicSignature::all_in(vec![words.into()], words.with_kind(ScalarKind::Float).into()))
 }
 
-fn resolve_color_to_ubyte4(arguments: &[ShaderType]) -> IntrinsicResolution {
+fn resolve_color_to_ubyte4(arguments: &[ShaderType], _profile: &SemanticsProfile) -> IntrinsicResolution {
     let float4: NumericType = NumericType::vector(ScalarKind::Float, 4);
     if arguments.len() == 1 {
         Ok(IntrinsicSignature::all_in(vec![float4.into()], float4.with_kind(ScalarKind::Int).into()))
@@ -1009,12 +1143,10 @@ fn pow(context: &IntrinsicContext, arguments: &[Value]) -> Value {
     map_float(
         context,
         arguments,
-        |math, operands| {
-            if is_square {
-                math.multiply(operands[0], operands[0])
-            } else {
-                exp2(math, math.multiply(log2(math, operands[0]), operands[1]))
-            }
+        |math, operands| match context.profile.lowering {
+            Lowering::Dxc if is_square => math.multiply(operands[0], operands[0]),
+            Lowering::Dxc => exp2(math, math.multiply(log2(math, operands[0]), operands[1])),
+            Lowering::SlangCpu => math.apply_binary(f32::powf, f64::powf, operands[0], operands[1]),
         },
         |units| {
             context.units.dimensionless(units[1], "pow's exponent");
@@ -1062,6 +1194,17 @@ fn fmod(math: &FloatOps, x: f64, y: f64) -> f64 {
 fn min_max(context: &IntrinsicContext, arguments: &[Value], is_min: bool) -> Value {
     let kind: ScalarKind = arguments[0].kind_at(0);
     let units = |tags: &[UnitTag]| context.units.same(tags[0], tags[1], if is_min { "min" } else { "max" });
+    if kind.is_float() && context.profile.lowering == Lowering::SlangCpu {
+        return map_float(
+            context,
+            arguments,
+            |_, operands| {
+                if is_min { FloatOps::min(operands[0], operands[1]) } else { FloatOps::max(operands[0], operands[1]) }
+            },
+            units,
+            None,
+        );
+    }
     if kind.is_float() {
         return map_bits(
             context,
@@ -1090,6 +1233,15 @@ fn clamp(context: &IntrinsicContext, arguments: &[Value]) -> Value {
         context.units.same(tags[0], tags[2], "clamp");
         context.units.same(tags[0], tags[1], "clamp")
     };
+    if kind.is_float() && context.profile.lowering == Lowering::SlangCpu {
+        return map_float(
+            context,
+            arguments,
+            |_, operands| FloatOps::min(FloatOps::max(operands[0], operands[1]), operands[2]),
+            units,
+            None,
+        );
+    }
     if kind.is_float() {
         // FMin(FMax(x, low), high)
         return map_bits(
@@ -1175,6 +1327,26 @@ fn sign(context: &IntrinsicContext, arguments: &[Value]) -> Value {
         result,
         arguments,
         |bits, kinds| {
+            if context.profile.lowering == Lowering::SlangCpu && kinds[0] == ScalarKind::Half {
+                let sign: i32 = if bits[0] & 0x7FFF == 0 {
+                    0
+                } else if bits[0] & 0x8000 != 0 {
+                    -1
+                } else {
+                    1
+                };
+                return scalars::from_int(sign);
+            }
+            if context.profile.lowering == Lowering::SlangCpu && kinds[0].is_float() {
+                let value: f64 = read(context, kinds[0], bits[0]);
+                return scalars::from_int(if value == 0.0 {
+                    0
+                } else if value < 0.0 {
+                    -1
+                } else {
+                    1
+                });
+            }
             let zero: u64 = scalars::convert(ScalarKind::Int, kinds[0], 0, context.profile);
             let is_positive: bool =
                 arithmetic::compare(BinaryOperator::Greater, kinds[0], bits[0], zero, context.profile);
@@ -1211,7 +1383,26 @@ fn mad(context: &IntrinsicContext, arguments: &[Value]) -> Value {
     )
 }
 
+/// C's frexp: x = mantissa · 2^exponent with |mantissa| in [0.5, 1) (sign kept); 0, infinity and NaN come back
+/// unchanged with exponent 0.
+fn c_frexp(value: f64) -> (f64, i32) {
+    if value == 0.0 || !value.is_finite() {
+        return (value, 0);
+    }
+    let (scaled, bias): (f64, i32) =
+        if value.abs() < f64::MIN_POSITIVE { (value * 18_446_744_073_709_551_616.0, 64) } else { (value, 0) };
+    let bits: u64 = scaled.to_bits();
+    let exponent: i32 = ((bits >> 52) & 0x7FF) as i32 - 1022;
+    (f64::from_bits((bits & !(0x7FFu64 << 52)) | (1022u64 << 52)), exponent - bias)
+}
+
 fn frexp(context: &IntrinsicContext, arguments: &[Value]) -> Value {
+    if context.profile.lowering == Lowering::SlangCpu {
+        let exponent: Value =
+            map_float(context, &arguments[..1], |_, operands| c_frexp(operands[0]).1 as f64, drop_silently, None);
+        context.set_output(1, exponent);
+        return map_float(context, &arguments[..1], |_, operands| c_frexp(operands[0]).0, drop_silently, None);
+    }
     // DXC: exponent and mantissa straight from the float bits; the mantissa loses the sign
     let exponent: Value = map_float(
         context,
@@ -1242,8 +1433,15 @@ fn frexp(context: &IntrinsicContext, arguments: &[Value]) -> Value {
     )
 }
 
-/// DXIL Dot2/3/4 (float) or an IMad chain (integers); a scalar dot is a multiply.
+/// DXIL Dot2/3/4 (float) or an IMad chain (integers); a scalar dot is a multiply. Slang's CPU dot sums from 0.
 fn dot_float(math: &FloatOps, left: &[f64], right: &[f64]) -> f64 {
+    if math.lowering() == Lowering::SlangCpu && left.len() > 1 {
+        let mut sum: f64 = 0.0;
+        for index in 0..left.len() {
+            sum = math.add(sum, math.multiply(left[index], right[index]));
+        }
+        return sum;
+    }
     let mut sum: f64 = math.multiply(left[0], right[0]);
     for index in 1..left.len() {
         sum = math.add(sum, math.multiply(left[index], right[index]));
@@ -1318,8 +1516,10 @@ fn length(context: &IntrinsicContext, vector: &Value) -> Value {
         unit = context.units.same(unit, vector.units[index], "length");
     }
     let components: Vec<f64> = (0..vector.bits.len()).map(|index| read(context, kind, vector.bits[index])).collect();
+    let is_scalar_abs: bool =
+        components.len() == 1 && (context.profile.lowering == Lowering::Dxc || vector.ty.is_scalar());
     let magnitude: f64 =
-        if components.len() == 1 { components[0].abs() } else { math.sqrt(dot_float(&math, &components, &components)) };
+        if is_scalar_abs { components[0].abs() } else { math.sqrt(dot_float(&math, &components, &components)) };
     Value::scalar(kind, scalars::encode_float(kind, magnitude, context.profile), unit)
 }
 
@@ -1347,6 +1547,23 @@ fn normalize(context: &IntrinsicContext, arguments: &[Value]) -> Value {
     let kind: ScalarKind = vector.kind_at(0);
     let math: FloatOps = FloatOps::new(kind, context.profile);
     let components: Vec<f64> = (0..vector.bits.len()).map(|index| read(context, kind, vector.bits[index])).collect();
+    if context.profile.lowering == Lowering::SlangCpu {
+        let mut unit: UnitTag = vector.units[0];
+        for index in 1..vector.units.len() {
+            unit = context.units.same(unit, vector.units[index], "normalize");
+        }
+        let direction: UnitTag = UnitTag { dimension: Dimension::NONE, is_adoptable: unit.is_adoptable };
+        let magnitude: f64 = if vector.ty.is_scalar() {
+            components[0].abs()
+        } else {
+            math.sqrt(dot_float(&math, &components, &components))
+        };
+        let bits: Vec<u64> = components
+            .iter()
+            .map(|component| scalars::encode_float(kind, math.divide(*component, magnitude), context.profile))
+            .collect();
+        return Value::new(vector.ty.clone(), bits, vec![direction; components.len()]);
+    }
     // v * rsqrt(dot(v, v))
     let inverse_length: f64 = rsqrt(&math, dot_float(&math, &components, &components));
     let mut unit: UnitTag = vector.units[0];
@@ -1402,7 +1619,8 @@ fn refract(context: &IntrinsicContext, arguments: &[Value]) -> Value {
     // k = 1 - (1 - d*d) * eta*eta; r = k >= 0 ? i*eta - (sqrt(k) + d*eta) * n : 0
     let k: f64 =
         math.subtract(1.0, math.multiply(math.subtract(1.0, math.multiply(dot, dot)), math.multiply(eta, eta)));
-    let refracts: bool = k >= 0.0;
+    // Slang returns 0 only when k < 0: a NaN k goes on
+    let refracts: bool = k >= 0.0 || (context.profile.lowering == Lowering::SlangCpu && k.is_nan());
     let scale: f64 = math.add(math.sqrt(k), math.multiply(dot, eta));
     let result: Vec<u64> = incident
         .iter()
@@ -1508,7 +1726,19 @@ fn mul(context: &IntrinsicContext, arguments: &[Value]) -> Value {
             }
             units[row * columns + column] = unit;
 
-            if kind.is_float() {
+            if kind.is_float() && context.profile.lowering == Lowering::SlangCpu {
+                let mut sum: f64 = 0.0;
+                for k in 0..inner {
+                    sum = math.add(
+                        sum,
+                        math.multiply(
+                            read(context, kind, left.bits[left_index(row, k)]),
+                            read(context, kind, right.bits[right_index(k, column)]),
+                        ),
+                    );
+                }
+                bits[row * columns + column] = scalars::encode_float(kind, sum, context.profile);
+            } else if kind.is_float() {
                 let mut accumulator: f64 = math.multiply(
                     read(context, kind, left.bits[left_index(row, 0)]),
                     read(context, kind, right.bits[right_index(0, column)]),
@@ -1572,12 +1802,13 @@ fn transpose(context: &IntrinsicContext, arguments: &[Value]) -> Value {
 /// Laplace expansion along the first row, folded ((t0 - t1) + t2) - t3, as DXC expands it.
 fn determinant(context: &IntrinsicContext, arguments: &[Value]) -> Value {
     let matrix: NumericType = *arguments[0].ty.as_numeric().expect("numeric");
-    let math: FloatOps = FloatOps::new(ScalarKind::Float, context.profile);
+    let kind: ScalarKind = matrix.kind;
+    let math: FloatOps = FloatOps::new(kind, context.profile);
     let size: usize = matrix.rows;
     let mut elements: Vec<Vec<f64>> = vec![vec![0.0; size]; size];
     for row in 0..size {
         for column in 0..size {
-            elements[row][column] = read_float(context, &arguments[0], row * size + column);
+            elements[row][column] = read(context, kind, arguments[0].bits[row * size + column]);
         }
     }
     let indices: Vec<usize> = (0..size).collect();
@@ -1596,8 +1827,8 @@ fn determinant(context: &IntrinsicContext, arguments: &[Value]) -> Value {
         );
     }
     Value::scalar(
-        ScalarKind::Float,
-        scalars::encode_float(ScalarKind::Float, result, context.profile),
+        kind,
+        scalars::encode_float(kind, result, context.profile),
         UnitTag { dimension: unit.unwrap_or(Dimension::NONE), is_adoptable: units.iter().all(|tag| tag.is_adoptable) },
     )
 }
@@ -1634,6 +1865,17 @@ fn lit(context: &IntrinsicContext, arguments: &[Value]) -> Value {
     let normal_dot_light: f64 = read_float(context, &arguments[0], 0);
     let normal_dot_half: f64 = read_float(context, &arguments[1], 0);
     let exponent: f64 = read_float(context, &arguments[2], 0);
+    if context.profile.lowering == Lowering::SlangCpu {
+        let diffuse: f64 = FloatOps::max(normal_dot_light, 0.0);
+        let step: f64 = if normal_dot_light < 0.0 { 0.0 } else { 1.0 };
+        let power: f64 = math.apply_binary(f32::powf, f64::powf, normal_dot_half, exponent);
+        let specular: f64 = math.multiply(step, FloatOps::max(power, 0.0));
+        let bits: Vec<u64> = [1.0, diffuse, specular, 1.0]
+            .iter()
+            .map(|component| scalars::encode_float(ScalarKind::Float, *component, context.profile))
+            .collect();
+        return Value::new(context.result_type.clone(), bits, vec![UnitTag::BARE; 4]);
+    }
     let specular: f64 = if normal_dot_light < 0.0 || normal_dot_half < 0.0 {
         0.0
     } else {
@@ -1670,7 +1912,7 @@ fn dst(context: &IntrinsicContext, arguments: &[Value]) -> Value {
 /// DXIL LegacyF32ToF16: WARP rounds toward zero (so finite overflow gives ±65504), NaN → 0x7FFF.
 fn f32_to_f16(value: f32, profile: &SemanticsProfile) -> u64 {
     if !profile.half_conversion_toward_zero {
-        return f16::from_f32(value).to_bits() as u64;
+        return scalars::float_to_half(value) as u64;
     }
     let bits: u32 = value.to_bits();
     let sign: u32 = (bits >> 16) & 0x8000;
@@ -1732,7 +1974,12 @@ fn color_to_ubyte4(context: &IntrinsicContext, arguments: &[Value]) -> Value {
     let bits: Vec<u64> = order
         .iter()
         .map(|index| {
-            let scaled: f32 = math.multiply(read_float(context, &arguments[0], *index), COLOR_TO_BYTE) as f32;
+            let factor: f64 = match context.profile.lowering {
+                Lowering::Dxc => COLOR_TO_BYTE,
+                // 255.001999f
+                Lowering::SlangCpu => f32::from_bits(0x437F_0083) as f64,
+            };
+            let scaled: f32 = math.multiply(read_float(context, &arguments[0], *index), factor) as f32;
             scalars::convert(ScalarKind::Float, ScalarKind::Int, scalars::from_float(scaled), context.profile)
         })
         .collect();

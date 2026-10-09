@@ -32,11 +32,19 @@ pub struct AppState {
     pub active_tab: Option<String>,
     pub side_panel_width: f64,
     pub result_column_width: f64,
+    /// The semantics profile the worksheets run with ("hlsl", "slang-cpu").
+    pub profile: String,
 }
 
 impl Default for AppState {
     fn default() -> AppState {
-        AppState { tab_order: Vec::new(), active_tab: None, side_panel_width: 420.0, result_column_width: 340.0 }
+        AppState {
+            tab_order: Vec::new(),
+            active_tab: None,
+            side_panel_width: 420.0,
+            result_column_width: 340.0,
+            profile: "hlsl".to_string(),
+        }
     }
 }
 

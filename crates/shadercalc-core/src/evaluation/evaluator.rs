@@ -139,6 +139,8 @@ pub struct Evaluator<'a> {
     frames: Vec<Frame>,
     last_result: Option<Value>,
     current_source: Option<String>,
+    /// Calls the reference can't be trusted on (WARP's own limits), in the order met.
+    reference_limits: Vec<String>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -174,6 +176,7 @@ impl<'a> Evaluator<'a> {
             frames: vec![Frame::new(None)],
             last_result: None,
             current_source: None,
+            reference_limits: Vec::new(),
         }
     }
 
@@ -184,6 +187,11 @@ impl<'a> Evaluator<'a> {
     /// Globals, uniforms and session variables as they stand.
     pub fn storage(&self) -> &Storage {
         self.storage
+    }
+
+    /// Why WARP's result can't be trusted for what ran so far (empty when it can).
+    pub fn take_reference_limits(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.reference_limits)
     }
 
     /// Initializes static globals (once per evaluation, like a shader invocation) and uniforms not set yet.
@@ -340,7 +348,7 @@ impl<'a> Evaluator<'a> {
                 Ok(Flow::Normal)
             }
             BoundStatementKind::If { condition, then, otherwise } => {
-                if self.evaluate(condition)?.get_bool(0) {
+                if self.evaluate(condition)?.get_bool(0, &self.profile) {
                     return self.execute(then);
                 }
                 match otherwise {
@@ -378,7 +386,7 @@ impl<'a> Evaluator<'a> {
         loop {
             if !(is_do_while && is_first)
                 && let Some(condition) = condition
-                && !self.evaluate(condition)?.get_bool(0)
+                && !self.evaluate(condition)?.get_bool(0, &self.profile)
             {
                 return Ok(Flow::Normal);
             }
@@ -439,11 +447,11 @@ impl<'a> Evaluator<'a> {
                 Ok(self.evaluate_binary(*operator, &left, &right, &expression.ty, expression.span))
             }
             BoundExpressionKind::Logical { is_and, left, right } => {
-                let left: bool = self.evaluate(left)?.get_bool(0);
+                let left: bool = self.evaluate(left)?.get_bool(0, &self.profile);
                 if left != *is_and {
                     return Ok(Value::from_bool(left));
                 }
-                Ok(Value::from_bool(self.evaluate(right)?.get_bool(0)))
+                Ok(Value::from_bool(self.evaluate(right)?.get_bool(0, &self.profile)))
             }
             BoundExpressionKind::Assignment { target, value } => {
                 self.not_in_constant_mode()?;
@@ -459,7 +467,11 @@ impl<'a> Evaluator<'a> {
                 self.evaluate_increment(target, *is_increment, *is_prefix, expression.span)
             }
             BoundExpressionKind::Conditional { condition, when_true, when_false } => {
-                if self.evaluate(condition)?.get_bool(0) { self.evaluate(when_true) } else { self.evaluate(when_false) }
+                if self.evaluate(condition)?.get_bool(0, &self.profile) {
+                    self.evaluate(when_true)
+                } else {
+                    self.evaluate(when_false)
+                }
             }
             BoundExpressionKind::Call { function, arguments, .. } => {
                 self.not_in_constant_mode()?;
@@ -488,6 +500,11 @@ impl<'a> Evaluator<'a> {
                 let result: Value = (intrinsic.implementation)(&context, &values);
                 let reports: Vec<(DiagnosticSeverity, String)> = context.units.take_reports();
                 let produced: Vec<Option<Value>> = context.outputs.into_inner();
+                for limit in context.reference_limits.into_inner() {
+                    if !self.reference_limits.contains(&limit) {
+                        self.reference_limits.push(limit);
+                    }
+                }
                 for (severity, message) in reports {
                     self.report(severity, message, expression.span);
                 }

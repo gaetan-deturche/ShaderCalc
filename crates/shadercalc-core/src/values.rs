@@ -51,10 +51,56 @@ pub mod scalars {
         f16::from_bits(bits as u16)
     }
 
+    /// Float to half bits, rounding to nearest even: Slang's f32tof16 (its CPU prelude), which the 16-bit half
+    /// stores with. (DXC compiles half as float, so only the Slang profile has halves.)
+    pub fn float_to_half(value: f32) -> u32 {
+        let in_bits: u32 = value.to_bits();
+        let sign: u32 = (in_bits >> 16) & 0x8000;
+        let exponent: u32 = (in_bits >> 23) & 0xff;
+        let fraction: u32 = in_bits & 0x007f_ffff;
+        if exponent == 255 {
+            // The payload is truncated; a NaN stays distinct from infinity
+            let payload: u32 = fraction >> 13;
+            return sign | 0x7c00 | payload | (payload == 0 && fraction != 0) as u32;
+        }
+        if exponent > 142 {
+            return sign | 0x7c00;
+        }
+        if exponent < 102 {
+            return sign;
+        }
+        let significand: u32 = fraction | 0x0080_0000;
+        // Below 2^-14, align to the half denormal grid at 2^-24
+        let shift: u32 = if exponent < 113 { 126 - exponent } else { 13 };
+        let mut result: u32 = if exponent < 113 { 0 } else { (exponent - 113) << 10 };
+        result += significand >> shift;
+        let remainder: u32 = significand & ((1 << shift) - 1);
+        let halfway: u32 = 1 << (shift - 1);
+        result += (remainder > halfway || (remainder == halfway && (result & 1) != 0)) as u32;
+        sign | result
+    }
+
+    /// Half bits to float: Slang's f16tof32 (its CPU prelude); denormals are scaled by 2^112.
+    pub fn half_to_float(value: u32) -> f32 {
+        let sign: u32 = (value & 0x8000) << 16;
+        let mut exponent: u32 = (value & 0x7c00) >> 10;
+        let mantissa: u32 = value & 0x03ff;
+        if exponent == 0 {
+            if mantissa != 0 {
+                let magic: f32 = f32::from_bits((127 + (127 - 15)) << 23);
+                return f32::from_bits(sign | ((value & 0x7fff) << 13)) * magic;
+            }
+        } else {
+            // Infinity and NaN keep their mantissa
+            exponent = if exponent == 0x1f { 0xff } else { exponent + (127 - 15) };
+        }
+        f32::from_bits(sign | (exponent << 23) | (mantissa << 13))
+    }
+
     /// A float kind's value as a double (exact for half, float and double).
     pub fn float_value(kind: ScalarKind, bits: u64) -> f64 {
         match kind {
-            ScalarKind::Half => to_half(bits).to_f64(),
+            ScalarKind::Half => half_to_float(bits as u32) as f64,
             ScalarKind::Float => to_float(bits) as f64,
             _ => to_double(bits),
         }
@@ -84,9 +130,10 @@ pub mod scalars {
         }
     }
 
-    pub fn is_true(kind: ScalarKind, bits: u64) -> bool {
+    /// A value tested as a condition: a float compares with 0, so denormals flush when the profile says so.
+    pub fn is_true(kind: ScalarKind, bits: u64, profile: &SemanticsProfile) -> bool {
         if kind.is_float() {
-            let value: f64 = float_value(kind, bits);
+            let value: f64 = read_float(kind, bits, profile);
             value != 0.0 || value.is_nan()
         } else {
             bits != 0
@@ -106,7 +153,8 @@ pub mod scalars {
     /// Encodes a float result in the kind (rounding to its precision).
     pub fn encode_float(kind: ScalarKind, value: f64, profile: &SemanticsProfile) -> u64 {
         match kind {
-            ScalarKind::Half => from_half(f16::from_f64(value)),
+            // Slang's half: computed in float, then stored
+            ScalarKind::Half => float_to_half(value as f32) as u64,
             ScalarKind::Float => from_float(flush(value as f32, profile)),
             _ => from_double(value),
         }
@@ -124,6 +172,8 @@ pub mod scalars {
     pub fn read_float(kind: ScalarKind, bits: u64, profile: &SemanticsProfile) -> f64 {
         match kind {
             ScalarKind::Float => flush(to_float(bits), profile) as f64,
+            // Slang's unsuffixed float literal is a float
+            ScalarKind::LiteralFloat if profile.literal_float_bits == 32 => to_double(bits) as f32 as f64,
             ScalarKind::LiteralFloat => to_double(bits),
             _ => float_value(kind, bits),
         }
@@ -135,11 +185,7 @@ pub mod scalars {
             return bits;
         }
         if to == ScalarKind::Bool {
-            return if from == ScalarKind::Float {
-                from_bool(read_float(from, bits, profile) != 0.0)
-            } else {
-                from_bool(is_true(from, bits))
-            };
+            return from_bool(is_true(from, bits, profile));
         }
         if from == ScalarKind::Bool {
             return if to.is_float() {
@@ -154,12 +200,18 @@ pub mod scalars {
             let value: f64 = read_float(from, bits, profile);
             return match to {
                 ScalarKind::Int => from_int(float_to_integer(value, i32::MIN as f64, i32::MAX as f64, profile) as i32),
+                // C++ on x86-64 converts to uint through int64 (cvttss2si on 64 bits), then keeps the low half
+                ScalarKind::UInt if !profile.saturate_float_to_int => {
+                    from_uint(float_to_integer(value, i64::MIN as f64, i64::MAX as f64, profile) as i64 as u32)
+                }
                 ScalarKind::UInt => from_uint(float_to_integer(value, 0.0, u32::MAX as f64, profile) as u32),
                 ScalarKind::Int64 | ScalarKind::LiteralInt => {
                     from_int64(float_to_integer(value, i64::MIN as f64, i64::MAX as f64, profile) as i64)
                 }
                 ScalarKind::UInt64 => float_to_uint64(value),
                 ScalarKind::LiteralFloat => from_double(value),
+                // DXC converts literals at compile time, where denormals survive
+                ScalarKind::Float if from == ScalarKind::LiteralFloat => from_float(value as f32),
                 _ => encode_float(to, value, profile),
             };
         }
@@ -188,7 +240,7 @@ pub mod scalars {
                     ScalarKind::UInt => bits as u32 as f64,
                     _ => bits as i64 as f64,
                 };
-                return from_half(f16::from_f64(value));
+                return float_to_half(value as f32) as u64;
             }
             return from_double(if from == ScalarKind::UInt64 { bits as f64 } else { bits as i64 as f64 });
         }
@@ -206,12 +258,14 @@ pub mod scalars {
         }
     }
 
+    /// Truncates toward zero. D3D saturates (NaN gives 0); a C++ cast on x86-64 (cvttss2si) gives the "integer
+    /// indefinite", the minimum, for NaN and values outside [minimum, -minimum).
     fn float_to_integer(value: f64, minimum: f64, maximum: f64, profile: &SemanticsProfile) -> f64 {
-        if value.is_nan() {
-            return 0.0;
-        }
         let truncated: f64 = value.trunc();
-        if profile.saturate_float_to_int { truncated.clamp(minimum, maximum) } else { truncated }
+        if profile.saturate_float_to_int {
+            return if value.is_nan() { 0.0 } else { truncated.clamp(minimum, maximum) };
+        }
+        if value.is_nan() || truncated < minimum || truncated >= -minimum { minimum } else { truncated }
     }
 
     fn float_to_uint64(value: f64) -> u64 {
@@ -285,8 +339,8 @@ impl Value {
         scalars::to_float(self.bits[index])
     }
 
-    pub fn get_bool(&self, index: usize) -> bool {
-        scalars::is_true(self.kind_at(index), self.bits[index])
+    pub fn get_bool(&self, index: usize, profile: &SemanticsProfile) -> bool {
+        scalars::is_true(self.kind_at(index), self.bits[index], profile)
     }
 
     /// Component as a double, whatever its kind (display, unit maths).
@@ -332,7 +386,7 @@ pub fn format_component(kind: ScalarKind, bits: u64) -> String {
         ScalarKind::UInt => (bits as u32).to_string(),
         ScalarKind::Int64 | ScalarKind::LiteralInt => (bits as i64).to_string(),
         ScalarKind::UInt64 => bits.to_string(),
-        ScalarKind::Half => format_double(scalars::to_half(bits).to_f64()),
+        ScalarKind::Half => format_half(bits as u32),
         ScalarKind::Float => format_float(scalars::to_float(bits)),
         ScalarKind::Double | ScalarKind::LiteralFloat => format_double(scalars::to_double(bits)),
     }
@@ -344,6 +398,24 @@ pub fn format_float(value: f32) -> String {
         Some(text) => text,
         None => format_shortest(&format!("{value:e}"), 9),
     }
+}
+
+/// Shortest text that reads back as the same half (up to 5 digits).
+pub fn format_half(bits: u32) -> String {
+    let value: f64 = scalars::half_to_float(bits) as f64;
+    if let Some(text) = special_real(value) {
+        return text;
+    }
+    let reads_back = |text: &str| text.parse::<f64>().is_ok_and(|parsed| scalars::float_to_half(parsed as f32) == bits);
+    let scientific: String = (0..5)
+        .map(|precision| format!("{value:.precision$e}"))
+        .find(|text| reads_back(text))
+        .unwrap_or_else(|| format!("{value:e}"));
+    // "1.200e-1" -> "1.2e-1"
+    let (mantissa, exponent) = scientific.split_once('e').expect("{:e} has an exponent");
+    let mantissa: &str =
+        if mantissa.contains('.') { mantissa.trim_end_matches('0').trim_end_matches('.') } else { mantissa };
+    format_shortest(&format!("{mantissa}e{exponent}"), 5)
 }
 
 pub fn format_double(value: f64) -> String {

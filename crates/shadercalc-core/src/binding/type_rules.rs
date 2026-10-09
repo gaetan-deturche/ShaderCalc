@@ -49,15 +49,21 @@ pub fn classify(from: &ShaderType, to: &ShaderType, is_explicit: bool) -> Conver
         if source.is_matrix() && target.is_matrix() && target.rows <= source.rows && target.columns <= source.columns {
             return ConversionInfo::possible(ConversionKind::Truncation, TRUNCATION_COST + kind_cost, truncation());
         }
-        // float4 <-> float1x4 / float4x1 implicitly; other same-size layouts by cast
-        let is_row_or_column: bool =
-            (source.is_vector() && target.is_matrix() && (target.rows == 1 || target.columns == 1))
-                || (source.is_matrix() && target.is_vector() && (source.rows == 1 || source.columns == 1));
-        if is_row_or_column && source.size() == target.size() {
-            return ConversionInfo::possible(ConversionKind::Flat, 20 + kind_cost, None);
-        }
-        if is_explicit && target.size() <= source.size() {
-            return ConversionInfo::possible(ConversionKind::Flat, 50 + kind_cost, None);
+        // Vector <-> matrix, implicitly too: same size (float2x2 <-> float4), or a row/column matrix that may
+        // truncate (float1x3 -> float2, float4 -> float1x2). Never float2x2 -> float2 or float1x4 -> float2x2.
+        if source.is_vector() != target.is_vector() && !source.is_scalar() && !target.is_scalar() {
+            let matrix: &NumericType = if source.is_matrix() { source } else { target };
+            let is_row_or_column: bool = matrix.rows == 1 || matrix.columns == 1;
+            if source.size() == target.size() {
+                return ConversionInfo::possible(
+                    ConversionKind::Flat,
+                    if is_row_or_column { 20 } else { 50 } + kind_cost,
+                    None,
+                );
+            }
+            if is_row_or_column && target.size() < source.size() {
+                return ConversionInfo::possible(ConversionKind::Flat, TRUNCATION_COST + kind_cost, truncation());
+            }
         }
         return ConversionInfo::impossible();
     }
@@ -236,6 +242,9 @@ pub fn resolve_binary(
         kind = common_kind(left.kind, right.kind);
     } else {
         kind = promote_kinds(left.kind, right.kind);
+        if operation == BinaryOperator::Remainder && kind == ScalarKind::Double {
+            return Err("'%' can't be used with doubles, cast to float first".to_string());
+        }
     }
 
     let Some(shape) = combine_shapes(left, right, kind, warning) else {

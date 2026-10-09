@@ -249,6 +249,7 @@ impl From<&ReferenceOutcome> for ReferenceDto {
                 ReferenceVerdict::Match => "match",
                 ReferenceVerdict::WithinTolerance => "withinTolerance",
                 ReferenceVerdict::Mismatch => "mismatch",
+                ReferenceVerdict::WarpLimit => "warpLimit",
                 ReferenceVerdict::NotChecked => "notChecked",
             },
             summary: outcome.to_string(),

@@ -36,6 +36,8 @@ pub enum ReferenceError {
     Compile(String),
     /// DXC or D3D12 isn't available, or failed outside the shader.
     Unavailable(String),
+    /// Running the shader removed the WARP device (the reason).
+    Crashed(String),
 }
 
 impl std::fmt::Display for ReferenceError {
@@ -43,6 +45,7 @@ impl std::fmt::Display for ReferenceError {
         match self {
             ReferenceError::Compile(errors) => write!(formatter, "DXC rejected the code:\n{errors}"),
             ReferenceError::Unavailable(message) => write!(formatter, "{message}"),
+            ReferenceError::Crashed(reason) => write!(formatter, "WARP stopped on this shader ({reason})"),
         }
     }
 }
@@ -298,11 +301,12 @@ impl Device {
 /// Compiles HLSL compute shaders with DXC (signed DXIL) and runs them on D3D12's WARP adapter. One thread, one
 /// output buffer (u0), one input buffer (t0).
 pub struct WarpDevice {
-    device: Mutex<Device>,
+    /// None after a shader removed the device: recreated on the next run.
+    device: Mutex<Option<Device>>,
 }
 
 static SHARED: LazyLock<Result<Arc<WarpDevice>, ReferenceError>> =
-    LazyLock::new(|| Device::create().map(|device| Arc::new(WarpDevice { device: Mutex::new(device) })));
+    LazyLock::new(|| Device::create().map(|device| Arc::new(WarpDevice { device: Mutex::new(Some(device)) })));
 
 type CachedRun = Result<(Vec<u32>, ComputeTimings), ReferenceError>;
 
@@ -321,10 +325,26 @@ impl WarpDevice {
         let clock: Instant = Instant::now();
         let bytecode: Vec<u8> = compile(hlsl, mode)?;
         let compile_milliseconds: f64 = clock.elapsed().as_secs_f64() * 1000.0;
-        let mut device =
+        let mut slot =
             self.device.lock().map_err(|_| ReferenceError::Unavailable("the WARP device is poisoned".to_string()))?;
-        let (words, pipeline_milliseconds, run_milliseconds) = device.run(&bytecode, inputs, output_words)?;
-        Ok((words, ComputeTimings { compile_milliseconds, pipeline_milliseconds, run_milliseconds }))
+        if slot.is_none() {
+            *slot = Some(Device::create()?);
+        }
+        let device: &mut Device = slot.as_mut().expect("created above");
+        match device.run(&bytecode, inputs, output_words) {
+            Ok((words, pipeline_milliseconds, run_milliseconds)) => {
+                Ok((words, ComputeTimings { compile_milliseconds, pipeline_milliseconds, run_milliseconds }))
+            }
+            Err(error) => {
+                // A removed device fails every later run: drop it (D3D12 hands back the same device while any
+                // reference lives) so the next run creates a fresh one
+                if let Err(reason) = unsafe { device.device.GetDeviceRemovedReason() } {
+                    *slot = None;
+                    return Err(ReferenceError::Crashed(reason.message()));
+                }
+                Err(error)
+            }
+        }
     }
 
     /// `run`, remembered by shader, inputs and mode: a worksheet re-evaluated on every edit only pays for the lines

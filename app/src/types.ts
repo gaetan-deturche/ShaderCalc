@@ -5,12 +5,20 @@ export interface DocumentText {
   text: string;
 }
 
+export interface Profile {
+  id: string;
+  label: string;
+  hasReference: boolean;
+}
+
 export interface LoadResult {
   folder: string;
   documents: DocumentText[];
   activeTab: string | null;
   sidePanelWidth: number;
   resultColumnWidth: number;
+  profile: string;
+  profiles: Profile[];
 }
 
 export type Severity = "error" | "warning" | "info";
@@ -67,7 +75,7 @@ export interface Evaluation {
   symbols: Symbol[];
 }
 
-export type Verdict = "match" | "withinTolerance" | "mismatch" | "notChecked";
+export type Verdict = "match" | "withinTolerance" | "mismatch" | "warpLimit" | "notChecked";
 
 export interface Reference {
   verdict: Verdict;

@@ -21,6 +21,8 @@ pub enum ReferenceVerdict {
     /// Differs only through functions the GPU approximates (sin, exp2...), within the tolerance.
     WithinTolerance,
     Mismatch,
+    /// Differs where WARP itself is known to be wrong (sinh, sin of huge angles...): `message` says why.
+    WarpLimit,
     /// The line can't be checked (no value, errors, DXC rejected the code...).
     NotChecked,
 }
@@ -50,6 +52,10 @@ impl fmt::Display for ReferenceOutcome {
                 };
                 write!(formatter, "≠ reference: {reference}{approximations}")
             }
+            ReferenceVerdict::WarpLimit => {
+                let reference: String = self.reference_value.as_ref().map(Value::to_string).unwrap_or_default();
+                write!(formatter, "⊘ WARP limit: WARP gives {reference} ({})", self.message.as_deref().unwrap_or(""))
+            }
             ReferenceVerdict::NotChecked => write!(formatter, "not checked: {}", self.message.as_deref().unwrap_or("")),
         }
     }
@@ -62,7 +68,7 @@ pub const APPROXIMATE_TOLERANCE_ULPS: i64 = 64;
 /// because the result is tiny.
 pub const APPROXIMATE_TOLERANCE_ABSOLUTE: f64 = 0.0008;
 
-fn not_checked(message: impl Into<String>, hlsl: String) -> ReferenceOutcome {
+pub fn not_checked(message: impl Into<String>, hlsl: String) -> ReferenceOutcome {
     ReferenceOutcome {
         verdict: ReferenceVerdict::NotChecked,
         reference_value: None,
@@ -74,8 +80,8 @@ fn not_checked(message: impl Into<String>, hlsl: String) -> ReferenceOutcome {
     }
 }
 
-/// Runs a calculator or worksheet line on the HLSL reference (DXC + WARP) and compares the bits. Literal call
-/// arguments, uniforms and session variables are fed through the input buffer, already converted to their concrete
+/// Runs a calculator or worksheet line on the HLSL reference (DXC + WARP) and compares the bits. The line's
+/// literals, uniforms and session variables are fed through the input buffer, already converted to their concrete
 /// types, so WARP executes the math instead of DXC folding it, while DXC's literal rules stay intact.
 pub fn check(line: &LineResult, mode: ReferenceMode) -> ReferenceOutcome {
     // Unit errors don't stop the numeric check; only a missing value does
@@ -102,7 +108,7 @@ pub fn check(line: &LineResult, mode: ReferenceMode) -> ReferenceOutcome {
     };
     let (words, timings) = match device.run_cached(&hlsl, &inputs, output_words, mode) {
         Ok((words, timings, _)) => (words, timings),
-        Err(error @ ReferenceError::Compile(_)) | Err(error @ ReferenceError::Unavailable(_)) => {
+        Err(error @ (ReferenceError::Compile(_) | ReferenceError::Unavailable(_) | ReferenceError::Crashed(_))) => {
             return not_checked(error.to_string(), hlsl);
         }
     };
@@ -124,14 +130,20 @@ pub fn check(line: &LineResult, mode: ReferenceMode) -> ReferenceOutcome {
     let max_ulps: i64 = max_ulps(value, &reference);
     let is_close: bool = max_ulps <= APPROXIMATE_TOLERANCE_ULPS
         || max_absolute_difference(value, &reference) <= APPROXIMATE_TOLERANCE_ABSOLUTE;
-    let verdict: ReferenceVerdict =
-        if uses_approximations && is_close { ReferenceVerdict::WithinTolerance } else { ReferenceVerdict::Mismatch };
+    let verdict: ReferenceVerdict = if uses_approximations && is_close {
+        ReferenceVerdict::WithinTolerance
+    } else if !line.reference_limits.is_empty() {
+        ReferenceVerdict::WarpLimit
+    } else {
+        ReferenceVerdict::Mismatch
+    };
+    let message: Option<String> = (verdict == ReferenceVerdict::WarpLimit).then(|| line.reference_limits.join("; "));
     ReferenceOutcome {
         verdict,
         reference_value: Some(reference),
         max_ulps,
         uses_approximations,
-        message: None,
+        message,
         hlsl,
         timings: Some(timings),
     }
@@ -194,17 +206,19 @@ fn build_harness(
     }
 
     emitter.harness.as_mut().expect("a harness").is_emitting_line = true;
+    emitter.text.push_str(&format!("    {};\n", declaration(result_type, "result")));
+    // A scope of its own: the line may redeclare a session variable (int a[4] after int a[3])
+    emitter.text.push_str("    {\n");
     let result: Option<&BoundExpression> = line.result();
     let body_count: usize = if result.is_some() { line.statements.len() - 1 } else { line.statements.len() };
     for statement in &line.statements[..body_count] {
-        emitter.emit_statement(statement, 1);
+        emitter.emit_statement(statement, 2);
     }
     let result_expression: String = match result {
         Some(result) => emitter.expression(result),
         None => line.result_variable.as_ref().map(|variable| variable.name.clone()).ok_or("the line has no value")?,
     };
-    emitter.text.push_str(&format!("    {};\n", declaration(result_type, "result")));
-    emitter.text.push_str(&format!("    result = {result_expression};\n"));
+    emitter.text.push_str(&format!("        result = {result_expression};\n    }}\n"));
 
     let mut word: usize = 0;
     for (component, path) in component_paths(result_type, "result").into_iter().enumerate() {

@@ -10,7 +10,7 @@ fn engine_helpers_evaluate() {
         &[
             ("PackRGBA8(float4(0.25, 0.5, 0.75, 1.0))", "4290740288"),
             ("KineticEnergy(2 kg, 3 m/s)", "9 kg·m²/s² (J)"),
-            ("Illuminance(100 cd, 2 m)", "25 cd/m² (lx)"),
+            ("Illuminance(100 cd, 2 m)", "25 cd/m² (lx or nit)"),
             ("Offset(2 m)", "3 m"),
             ("Pythagoras(0.7)", "1"),
             ("Hash(42u)", "388445122"),
@@ -106,6 +106,17 @@ fn calculator_evaluates() {
             ("pow(3 m, 2)", "9 m²"),
             ("60Hz * 2 s", "120"),
             ("100 km / 2 h", "13.888889 m/s"),
+            // The full table: prefixes, names, plurals, bytes, rendering units
+            ("2 kPa", "2000 kg/m·s² (Pa)"),
+            ("1 µs + 1 us", "2E-06 s"),
+            ("3 hours", "10800 s"),
+            ("5 feet", "1.524 m"),
+            ("16 MiB", "16777216 B"),
+            ("8 b", "1 B"),
+            ("100 nit", "100 cd/m² (lx or nit)"),
+            ("1 Bq", "1 1/s (Hz)"),
+            ("1 Tbsp / 1 tsp", "3"),
+            ("float t = 2; 3 m / t", "1.5 m"),
         ],
         |line| eval(&mut session(""), line),
     );

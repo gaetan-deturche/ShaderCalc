@@ -1,8 +1,6 @@
-use half::f16;
-
 use crate::binding::bound_tree::{BinaryOperator, UnaryOperator};
 use crate::binding::type_rules;
-use crate::semantics::SemanticsProfile;
+use crate::semantics::{Lowering, SemanticsProfile};
 use crate::types::ScalarKind;
 use crate::values::scalars;
 
@@ -11,24 +9,35 @@ use crate::values::scalars;
 #[derive(Clone, Copy)]
 pub struct FloatOps<'a> {
     kind: ScalarKind,
+    /// Literal-only math, which DXC folds at compile time (in double).
+    is_literal: bool,
     profile: &'a SemanticsProfile,
 }
 
 impl<'a> FloatOps<'a> {
     pub fn new(kind: ScalarKind, profile: &'a SemanticsProfile) -> FloatOps<'a> {
-        let kind: ScalarKind = if kind == ScalarKind::LiteralFloat { ScalarKind::Double } else { kind };
-        FloatOps { kind, profile }
+        let is_literal: bool = kind == ScalarKind::LiteralFloat;
+        // DXC's literal float is 64-bit, Slang's a float
+        let literal_kind: ScalarKind =
+            if profile.literal_float_bits == 32 { ScalarKind::Float } else { ScalarKind::Double };
+        let kind: ScalarKind = if is_literal { literal_kind } else { kind };
+        FloatOps { kind, is_literal, profile }
     }
 
     pub fn is_double(&self) -> bool {
         self.kind == ScalarKind::Double
     }
 
+    pub fn lowering(&self) -> Lowering {
+        self.profile.lowering
+    }
+
     /// Rounds to the kind's precision (and flushes denormals if the profile says so).
     pub fn round(&self, value: f64) -> f64 {
         match self.kind {
             ScalarKind::Float => scalars::flush(value as f32, self.profile) as f64,
-            ScalarKind::Half => f16::from_f64(value).to_f64(),
+            // Slang's half: computed in float, then stored as a half
+            ScalarKind::Half => scalars::half_to_float(scalars::float_to_half(value as f32)) as f64,
             _ => value,
         }
     }
@@ -53,9 +62,10 @@ impl<'a> FloatOps<'a> {
         -value
     }
 
-    /// Float `%`: WARP's (q - trunc(q)) * b, or C's exact fmod (computing it in double loses nothing).
+    /// Float `%`: WARP's (q - trunc(q)) * b, or C's exact fmod (computing it in double loses nothing). DXC folds
+    /// literal operands with fmod (-0.0 % 7 is -0).
     pub fn remainder(&self, left: f64, right: f64) -> f64 {
-        if !self.profile.float_remainder_from_quotient {
+        if !self.profile.float_remainder_from_quotient || self.is_literal {
             return self.round(left % right);
         }
         let quotient: f64 = self.divide(left, right);
@@ -84,7 +94,16 @@ impl<'a> FloatOps<'a> {
         if self.kind == ScalarKind::Double { wide(value) } else { self.round(single(value as f32) as f64) }
     }
 
-    /// IEEE minNum / maxNum: a NaN operand yields the other one (DXIL FMin / FMax).
+    /// Applies a two-argument math function at the kind's precision.
+    pub fn apply_binary(&self, single: fn(f32, f32) -> f32, wide: fn(f64, f64) -> f64, left: f64, right: f64) -> f64 {
+        if self.kind == ScalarKind::Double {
+            wide(left, right)
+        } else {
+            self.round(single(left as f32, right as f32) as f64)
+        }
+    }
+
+    /// IEEE minNum / maxNum: a NaN operand yields the other one (DXIL FMin / FMax, C's fmin / fmax).
     pub fn min(left: f64, right: f64) -> f64 {
         if left.is_nan() {
             right
@@ -199,6 +218,13 @@ fn width(kind: ScalarKind, profile: &SemanticsProfile) -> u32 {
     }
 }
 
+/// An unsuffixed integer literal in Slang is an int, or an int64_t when it doesn't fit.
+fn literal_width(kind: ScalarKind, left: u64, right: u64, profile: &SemanticsProfile) -> u32 {
+    let fits = |bits: u64| i32::try_from(bits as i64).is_ok();
+    let width: u32 = width(kind, profile);
+    if kind == ScalarKind::LiteralInt && width == 32 && !(fits(left) && fits(right)) { 64 } else { width }
+}
+
 fn integer_binary(
     operation: BinaryOperator,
     kind: ScalarKind,
@@ -208,7 +234,7 @@ fn integer_binary(
     fault: &mut Option<String>,
 ) -> u64 {
     *fault = None;
-    let width: u32 = width(kind, profile);
+    let width: u32 = literal_width(kind, left, right, profile);
     let is_signed: bool = matches!(kind, ScalarKind::Int | ScalarKind::Int64 | ScalarKind::LiteralInt);
     // Work in 64 bits, then wrap to the width
     let signed_left: i64 =
@@ -227,8 +253,11 @@ fn integer_binary(
             let maximum: i64 = if width == 32 { i32::MAX as i64 } else { i64::MAX };
             if unsigned_right == 0 {
                 // D3D defines udiv by 0 as all ones; signed division by 0 is undefined (WARP: INT_MAX)
-                *fault =
-                    Some("integer division by zero (undefined: the GPU result is implementation-defined)".to_string());
+                *fault = Some(if profile.has_reference() {
+                    "integer division by zero (undefined: the GPU result is implementation-defined)".to_string()
+                } else {
+                    "integer division by zero (undefined in C++: x86 traps)".to_string()
+                });
                 if is_signed && profile.undefined_signed_division_is_max { maximum as u64 } else { u64::MAX }
             } else if is_signed {
                 let minimum: i64 = if width == 32 { i32::MIN as i64 } else { i64::MIN };
@@ -322,7 +351,7 @@ pub fn compare(operation: BinaryOperator, kind: ScalarKind, left: u64, right: u6
 pub fn unary(operation: UnaryOperator, kind: ScalarKind, value: u64, profile: &SemanticsProfile) -> u64 {
     match operation {
         UnaryOperator::Plus => value,
-        UnaryOperator::LogicalNot => scalars::from_bool(!scalars::is_true(kind, value)),
+        UnaryOperator::LogicalNot => scalars::from_bool(!scalars::is_true(kind, value, profile)),
         UnaryOperator::BitwiseNot => match kind {
             ScalarKind::Int => scalars::from_int(!(value as i32)),
             ScalarKind::UInt => !(value as u32) as u64,

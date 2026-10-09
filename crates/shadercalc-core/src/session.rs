@@ -12,6 +12,7 @@ use crate::syntax::tree::{CompilationUnitSyntax, DeclarationSyntax, ItemSyntax, 
 use crate::types::{NumericType, ScalarKind, ShaderType};
 use crate::units::UNITS;
 use crate::values::{Value, scalars};
+use crate::worksheet::declared_names;
 
 /// The outcome of one calculator or worksheet line.
 #[derive(Clone, Debug, Default)]
@@ -24,6 +25,8 @@ pub struct LineResult {
     pub program: Option<Arc<BoundProgram>>,
     /// Calculator variables and uniforms as the line found them (what a reference run must start from).
     pub inputs: Storage,
+    /// Why WARP's result can't be trusted for this line (sinh, sin of huge angles...); empty when it can.
+    pub reference_limits: Vec<String>,
 }
 
 impl LineResult {
@@ -132,8 +135,19 @@ impl ShaderSession {
         let mut diagnostics: DiagnosticBag = DiagnosticBag::new();
         let type_names: Vec<String> = self.program.type_names.keys().cloned().collect();
         let items: Vec<ItemSyntax> = {
-            let is_unit_name = |name: &str| self.is_unit_name(name);
-            parse_interactive(line, LINE_SOURCE_NAME, &mut diagnostics, &type_names, &is_unit_name)
+            let parse = |diagnostics: &mut DiagnosticBag, declared: &[String]| {
+                let is_unit_name = |name: &str| self.is_unit_name(name) && !declared.iter().any(|other| other == name);
+                parse_interactive(line, LINE_SOURCE_NAME, diagnostics, &type_names, &is_unit_name)
+            };
+            let items: Vec<ItemSyntax> = parse(&mut diagnostics, &[]);
+            // Unless the line itself names something h (`float t = 2; 3 m / t`)
+            let declared: Vec<String> = declared_names(&items);
+            if declared.iter().any(|name| UNITS.contains_key(name.as_str())) {
+                diagnostics = DiagnosticBag::new();
+                parse(&mut diagnostics, &declared)
+            } else {
+                items
+            }
         };
         if diagnostics.has_errors() {
             return LineResult::new(None, diagnostics.into_items(), None);
@@ -204,10 +218,10 @@ impl ShaderSession {
         }
         let program: Arc<BoundProgram> = self.program.clone();
         let mut inputs: Storage = Storage::new();
-        let run: Result<Option<Value>, Interrupt> = {
+        let (run, reference_limits): (Result<Option<Value>, Interrupt>, Vec<String>) = {
             let mut evaluator: Evaluator =
                 Evaluator::new(&self.profile, &self.options, &mut storage, &mut diagnostics, LINE_SOURCE_NAME);
-            evaluator.initialize_globals(&program).and_then(|_| {
+            let outcome: Result<Option<Value>, Interrupt> = evaluator.initialize_globals(&program).and_then(|_| {
                 // What the line starts from, once the globals are initialised
                 inputs = evaluator
                     .storage()
@@ -216,7 +230,8 @@ impl ShaderSession {
                     .map(|(variable, value)| (variable.clone(), value.clone()))
                     .collect();
                 evaluator.run(&bound)
-            })
+            });
+            (outcome, evaluator.take_reference_limits())
         };
         let mut result: Option<Value> = match run {
             Ok(value) => value,
@@ -271,6 +286,7 @@ impl ShaderSession {
             message: None,
             program: Some(program),
             inputs,
+            reference_limits,
         }
     }
 }

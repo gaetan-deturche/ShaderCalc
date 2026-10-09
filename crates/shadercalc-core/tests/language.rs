@@ -124,6 +124,19 @@ const CASES: &[(&str, &str)] = &[
     ("float2x2 m = { 1, 2, 3, 4 }; m._m10_m01", "float2(3, 2)"),
     ("int x = 5; x += 3; x <<= 2; x", "32"),
     ("float3 v = float3(1, 2, 3); v.zx = v.xz; v", "float3(3, 2, 1)"),
+    // Casts splat and convert where constructors can't
+    ("(float2)3.7", "float2(3.7, 3.7)"),
+    ("float4 v = float2x2(1, 2, 3, 4)", "float4(1, 2, 3, 4)"),
+    ("(float2)float1x3(1, 2, 3)", "float2(1, 2)"),
+    // Literal math folds like DXC: in double, fmod, no denormal flush
+    ("-0.0 % 7", "-0"),
+    ("asuint(float(1e-40))", "71362"),
+    // A float tested as a condition is compared with 0, so a denormal is false
+    ("any(asfloat(0x1u))", "false"),
+    ("!1e-40f", "true"),
+    // Typed literals reach WARP through the buffer too, not folded by DXC
+    ("ceil(asfloat(0x1u))", "0"),
+    ("1e-38f * 1e-5f", "0"),
 ];
 
 fn program_session() -> ShaderSession {
@@ -182,6 +195,11 @@ fn reports_errors() {
     );
     assert_program_error("float F() { const float k = 1; k = 2; return k; }", "is const");
     assert_program_error("float Exposure; void F() { Exposure = 1; }", "read-only");
+    assert_program_error("float2 F() { return float2(3.7); }", "needs 2 components");
+    assert_program_error("float2 F(float2x2 m) { return (float2)m; }", "can't convert");
+    assert_program_error("float2x2 F(float1x4 m) { return m; }", "can't convert");
+    assert_program_error("float2x2 F(float2x2 m) { return normalize(m); }", "needs vectors");
+    assert_program_error("double F(double a) { return a % 2.0; }", "can't be used with doubles");
 }
 
 #[test]
@@ -189,7 +207,38 @@ fn approximations_are_flagged_not_hidden() {
     let result: LineResult = ShaderSession::default().evaluate("tanh(100.0)");
     assert_eq!("1", result.text());
     let outcome: ReferenceOutcome = checker::check(&result, ReferenceMode::Strict);
-    // WARP's tanh overflows to NaN here; the difference is reported, attributed to approximate functions
-    assert_eq!(ReferenceVerdict::Mismatch, outcome.verdict, "{outcome}");
+    // WARP's tanh(100) is 9.1: reported as WARP's limit, with the reason
+    assert_eq!(ReferenceVerdict::WarpLimit, outcome.verdict, "{outcome}");
     assert!(outcome.uses_approximations);
+    assert!(outcome.message.as_deref().unwrap_or("").contains("tanh"), "{outcome}");
+}
+
+#[test]
+fn warp_limits_are_not_mismatches() {
+    for (line, reason) in [("sinh(7)", "sinh"), ("tanh(7)", "tanh"), ("sin(1048576.0f)", "100π"), ("tan(33)", "pole")]
+    {
+        let outcome: ReferenceOutcome = checker::check(&ShaderSession::default().evaluate(line), ReferenceMode::Strict);
+        assert_eq!(ReferenceVerdict::WarpLimit, outcome.verdict, "{line}: {outcome}");
+        assert!(outcome.message.as_deref().unwrap_or("").contains(reason), "{line}: {outcome}");
+    }
+    // Inside D3D's range sin is checked as usual
+    let outcome: ReferenceOutcome =
+        checker::check(&ShaderSession::default().evaluate("sin(2.0)"), ReferenceMode::Strict);
+    assert!(matches!(outcome.verdict, ReferenceVerdict::Match | ReferenceVerdict::WithinTolerance), "{outcome}");
+}
+
+#[test]
+fn a_line_may_redeclare_a_session_variable() {
+    let mut session: ShaderSession = ShaderSession::default();
+    session.evaluate("int a[3] = { 1, 2, 3 }");
+    let result: LineResult = session.evaluate("int a[] = { 1, 2, 3, 4 }");
+    assert_eq!("{1, 2, 3, 4}", result.text());
+    let outcome: ReferenceOutcome = checker::check(&result, ReferenceMode::Strict);
+    assert_eq!(
+        ReferenceVerdict::Match,
+        outcome.verdict,
+        "{outcome}
+{}",
+        outcome.hlsl
+    );
 }

@@ -18,6 +18,8 @@ pub struct IntrinsicContext<'a> {
     pub units: UnitChecker,
     /// Values for out arguments, by argument index.
     pub outputs: RefCell<Vec<Option<Value>>>,
+    /// Why WARP can't be trusted for this call (see `limit_reference`).
+    pub reference_limits: RefCell<Vec<String>>,
 }
 
 impl<'a> IntrinsicContext<'a> {
@@ -36,6 +38,15 @@ impl<'a> IntrinsicContext<'a> {
             profile,
             units: UnitChecker::new(is_strict_units),
             outputs: RefCell::new(vec![None; argument_count]),
+            reference_limits: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Notes that WARP is known to be wrong for this call, so a reference mismatch is WARP's limit, not ours.
+    pub fn limit_reference(&self, reason: String) {
+        let mut limits = self.reference_limits.borrow_mut();
+        if !limits.contains(&reason) {
+            limits.push(reason);
         }
     }
 

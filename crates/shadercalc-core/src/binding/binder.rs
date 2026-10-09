@@ -14,7 +14,7 @@ use crate::syntax::parser::is_builtin_type_name;
 use crate::syntax::tree::*;
 use crate::types::{NumericType, ScalarKind, ShaderType, StructField, StructType};
 use crate::units::UnitTag;
-use crate::values::Value;
+use crate::values::{Value, scalars};
 
 type Scope = HashMap<String, VariableRef>;
 
@@ -649,10 +649,21 @@ impl<'a> Binder<'a> {
 
     // ---------------------------------------------------------------- Types
 
+    /// A built-in type name; `half` is 16-bit where the profile says so (Slang CPU), float otherwise (DXC).
+    fn builtin_type(&self, name: &str) -> Result<Option<ShaderType>, String> {
+        let builtin: Option<ShaderType> = try_parse_builtin_type(name)?;
+        Ok(match builtin {
+            Some(ShaderType::Numeric(numeric)) if self.profile.half_is_16_bit && name.starts_with("half") => {
+                Some(numeric.with_kind(ScalarKind::Half).into())
+            }
+            other => other,
+        })
+    }
+
     fn resolve_type(&mut self, syntax: &TypeSyntax) -> Option<ShaderType> {
         match syntax {
             TypeSyntax::Named { name, span } => {
-                match try_parse_builtin_type(name) {
+                match self.builtin_type(name) {
                     Ok(Some(builtin)) => return Some(builtin),
                     Err(error) => {
                         self.error(*span, error);
@@ -1155,6 +1166,13 @@ impl<'a> Binder<'a> {
 
     fn bind_expression(&mut self, syntax: &ExpressionSyntax) -> BoundExpression {
         match &syntax.kind {
+            // `1.5h` is a 16-bit half where the profile has them
+            ExpressionKind::Literal { kind, bits, text }
+                if self.profile.half_is_16_bit && *kind == ScalarKind::Float && text.to_lowercase().ends_with('h') =>
+            {
+                let half: u64 = scalars::float_to_half(scalars::to_float(*bits)) as u64;
+                BoundExpression::literal(Value::scalar(ScalarKind::Half, half, UnitTag::BARE), syntax.span)
+            }
             ExpressionKind::Literal { kind, bits, .. } => {
                 BoundExpression::literal(Value::scalar(*kind, *bits, UnitTag::BARE), syntax.span)
             }
@@ -1545,7 +1563,7 @@ impl<'a> Binder<'a> {
         span: SourceSpan,
     ) -> BoundExpression {
         // Constructors: float3(...), a typedef'd vector type...
-        if let Ok(Some(builtin)) = try_parse_builtin_type(name) {
+        if let Ok(Some(builtin)) = self.builtin_type(name) {
             return self.bind_constructor(&builtin, argument_syntax, span);
         }
         match self.type_names.get(name).cloned() {
@@ -1601,8 +1619,9 @@ impl<'a> Binder<'a> {
                 return BoundExpression::error(span);
             }
         }
+        // No splat: float2(3.7) is an error in DXC, unlike the cast (float2)3.7
         let count: usize = arguments.iter().map(|argument| argument.ty.component_count()).sum();
-        if count != numeric.size() && !(arguments.len() == 1 && count == 1) {
+        if count != numeric.size() {
             self.error(span, format!("{} needs {} components, got {}", numeric, numeric.size(), count));
             return BoundExpression::error(span);
         }
@@ -1714,7 +1733,7 @@ impl<'a> Binder<'a> {
         span: SourceSpan,
     ) -> BoundExpression {
         let argument_types: Vec<ShaderType> = arguments.iter().map(|argument| argument.ty.clone()).collect();
-        let signature: IntrinsicSignature = match (intrinsic.resolve)(&argument_types) {
+        let signature: IntrinsicSignature = match (intrinsic.resolve)(&argument_types, &self.profile) {
             Ok(signature) => signature,
             Err(error) => {
                 let list: Vec<String> = argument_types.iter().map(ShaderType::to_string).collect();

@@ -62,6 +62,8 @@ export function markOf(problem: Severity | null, reference: Reference | undefine
       return { mark: "✓", kind: "match" };
     case "withinTolerance":
       return { mark: "≈", kind: "approximate" };
+    case "warpLimit":
+      return { mark: "⊘", kind: "warning" };
     case "notChecked":
       return { mark: "–", kind: "dim" };
   }

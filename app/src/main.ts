@@ -3,7 +3,7 @@ import { call, isTauri } from "./api";
 import { DocsPanel } from "./docs";
 import { COMMON_TYPES, KEYWORDS } from "./hlsl";
 import { buildInspector, emptyInspector } from "./inspector";
-import { DocEntry, DocumentText, Evaluation, Line, LoadResult, OutsideChanges, Reference } from "./types";
+import { DocEntry, DocumentText, Evaluation, Line, LoadResult, OutsideChanges, Profile, Reference } from "./types";
 import { CompletionEntry, WorksheetView } from "./worksheet-view";
 
 const EXTENSION: string = ".hlsl";
@@ -15,6 +15,7 @@ const statusText: HTMLElement = document.getElementById("status") as HTMLElement
 const referenceText: HTMLElement = document.getElementById("reference-status") as HTMLElement;
 const folderText: HTMLElement = document.getElementById("folder") as HTMLElement;
 const app: HTMLElement = document.getElementById("app") as HTMLElement;
+const profileSelect: HTMLSelectElement = document.getElementById("profile-select") as HTMLSelectElement;
 
 const docs: DocsPanel = new DocsPanel();
 const views: WorksheetView[] = [];
@@ -27,7 +28,9 @@ let latestGeneration: number = 0;
 let resultWidth: number = 340;
 let saveTimer: number | undefined;
 let evaluateTimer: number | undefined;
-let counts = { matches: 0, approximations: 0, mismatches: 0 };
+let counts = { matches: 0, approximations: 0, mismatches: 0, limits: 0 };
+let profiles: Profile[] = [];
+let profile: string = "hlsl";
 
 function displayName(name: string): string {
   return name.toLowerCase().endsWith(EXTENSION) ? name.slice(0, -EXTENSION.length) : name;
@@ -217,6 +220,7 @@ async function saveState(): Promise<void> {
       activeTab: active?.name ?? null,
       sidePanelWidth: side,
       resultColumnWidth: active?.resultWidth ?? resultWidth,
+      profile,
     },
   });
 }
@@ -267,7 +271,7 @@ async function runEvaluation(): Promise<void> {
   const documents: DocumentText[] = views.map((view: WorksheetView) => ({ name: view.name, text: view.text }));
   let result: Evaluation | { cancelled: true };
   try {
-    result = await call<Evaluation | { cancelled: true }>("evaluate", { documents });
+    result = await call<Evaluation | { cancelled: true }>("evaluate", { documents, profile });
   } catch (error) {
     statusText.textContent = `Evaluation failed: ${(error as Error).message ?? error}`;
     return;
@@ -277,7 +281,7 @@ async function runEvaluation(): Promise<void> {
   }
   latestGeneration = result.generation;
   lastEvaluation = result;
-  counts = { matches: 0, approximations: 0, mismatches: 0 };
+  counts = { matches: 0, approximations: 0, mismatches: 0, limits: 0 };
   for (const view of views) {
     view.applyEvaluation(
       result.lines.filter((line: Line) => line.document === view.name),
@@ -331,6 +335,8 @@ async function runReferences(evaluation: Evaluation): Promise<void> {
       counts.approximations++;
     } else if (reference.verdict === "mismatch") {
       counts.mismatches++;
+    } else if (reference.verdict === "warpLimit") {
+      counts.limits++;
     }
     views.find((view: WorksheetView) => view.name === line.document)?.applyReference(line.index, reference);
     showReferenceProgress(index + 1, lines.length);
@@ -338,8 +344,16 @@ async function runReferences(evaluation: Evaluation): Promise<void> {
 }
 
 function showReferenceProgress(done: number, total: number): void {
+  const current: Profile | undefined = profiles.find((candidate: Profile) => candidate.id === profile);
+  if (current !== undefined && !current.hasReference) {
+    referenceText.textContent = total === 0 ? "" : `No reference: DXC + WARP check HLSL, not ${current.label}`;
+    return;
+  }
   const parts: string =
-    `✓ ${counts.matches}` + (counts.approximations > 0 ? `  ≈ ${counts.approximations}` : "") + (counts.mismatches > 0 ? `  ≠ ${counts.mismatches}` : "");
+    `✓ ${counts.matches}` +
+    (counts.approximations > 0 ? `  ≈ ${counts.approximations}` : "") +
+    (counts.mismatches > 0 ? `  ≠ ${counts.mismatches}` : "") +
+    (counts.limits > 0 ? `  ⊘ ${counts.limits}` : "");
   referenceText.textContent = total === 0 ? "" : done < total ? `Reference ${done}/${total} · ${parts}` : `Reference (DXC + WARP): ${parts}`;
 }
 
@@ -429,6 +443,17 @@ async function start(): Promise<void> {
   units = await call<{ name: string; detail: string }[]>("units");
   intrinsics = docs.entries.filter((entry: DocEntry) => entry.signature !== null).map((entry: DocEntry) => entry.name);
   resultWidth = loaded.resultColumnWidth;
+  profiles = loaded.profiles;
+  profile = loaded.profile;
+  profileSelect.replaceChildren(
+    ...profiles.map((candidate: Profile) => {
+      const option: HTMLOptionElement = document.createElement("option");
+      option.value = candidate.id;
+      option.textContent = candidate.label;
+      return option;
+    }),
+  );
+  profileSelect.value = profile;
   folderText.textContent = loaded.folder;
   setupLayout(loaded.sidePanelWidth);
   for (const document of loaded.documents) {
@@ -444,6 +469,12 @@ document.getElementById("new-button")?.addEventListener("click", () => void newW
 document.getElementById("rename-button")?.addEventListener("click", () => void renameActive());
 document.getElementById("delete-button")?.addEventListener("click", () => void deleteActive());
 document.getElementById("folder-button")?.addEventListener("click", () => void call("openFolder"));
+profileSelect.addEventListener("change", () => {
+  profile = profileSelect.value;
+  void saveState();
+  requestEvaluation();
+  active?.focus();
+});
 for (const tab of document.querySelectorAll<HTMLElement>(".side-tab")) {
   tab.addEventListener("click", () => showPanel(tab.dataset.panel === "docs" ? "docs" : "inspector"));
 }
@@ -463,6 +494,7 @@ if (isTauri) {
 (window as unknown as { shaderCalc: object }).shaderCalc = {
   results: (): string => active?.resultsText() ?? "",
   activeName: (): string | null => active?.name ?? null,
+  profile: (): string => profile,
   tabNames: (): string[] => views.map((view: WorksheetView) => view.name),
 };
 

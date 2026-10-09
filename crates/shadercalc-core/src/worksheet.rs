@@ -120,12 +120,15 @@ pub fn evaluate(
                 && diagnostic.span.offset < line.span.end() + 1
         }));
         let mut value: Option<Value> = None;
+        let mut reference_limits: Vec<String> = Vec::new();
         if !line_diagnostics.has_errors() {
             let outcome: Result<Option<Value>, Interrupt> = {
                 let mut evaluator: Evaluator =
                     Evaluator::new(profile, options, &mut storage, &mut line_diagnostics, &line.source);
                 evaluator.set_current_source(&line.source);
-                evaluator.run_line(line)
+                let outcome: Result<Option<Value>, Interrupt> = evaluator.run_line(line);
+                reference_limits = evaluator.take_reference_limits();
+                outcome
             };
             match outcome {
                 Ok(Some(result)) => {
@@ -171,6 +174,7 @@ pub fn evaluate(
             message: None,
             program: Some(bound.program.clone()),
             inputs,
+            reference_limits,
         };
         let last_line: usize = match line_starts.get(line.source.as_str()) {
             Some(starts) => line_of(starts, line.span.end().saturating_sub(1).max(line.span.offset)),
@@ -213,7 +217,7 @@ fn parse(
     (sources, diagnostics.into_items())
 }
 
-fn declared_names(items: &[ItemSyntax]) -> Vec<String> {
+pub(crate) fn declared_names(items: &[ItemSyntax]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for item in items {
         match item {

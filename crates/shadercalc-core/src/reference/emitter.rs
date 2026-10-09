@@ -290,13 +290,47 @@ impl HlslEmitter {
             let mut texts: Vec<String> = Vec::new();
             for (index, argument) in arguments.iter().enumerate() {
                 let text: String = if intrinsic.constant_sensitive_arguments.contains(&index) {
-                    self.base_expression(argument)
+                    self.without_loads(|emitter| emitter.expression(argument))
                 } else {
                     self.expression(argument)
                 };
                 texts.push(text);
             }
             return format!("{}({})", intrinsic.name, texts.join(", "));
+        }
+        // float3(1, 2, 3): its literal components, converted to the component kind
+        if let BoundExpressionKind::Construct { sources, is_initializer_list: false } = &expression.kind
+            && let ShaderType::Numeric(target) = &expression.ty
+        {
+            let mut texts: Vec<String> = Vec::new();
+            for source in sources {
+                let constant: Option<Value> = match &source.ty {
+                    ShaderType::Numeric(numeric) if numeric.kind.is_literal() => {
+                        try_evaluate_constant(source, &SemanticsProfile::HLSL)
+                    }
+                    _ => None,
+                };
+                let text: String = match constant {
+                    Some(constant) => {
+                        let bits: u64 = scalars::convert(
+                            constant.kind_at(0),
+                            target.kind,
+                            constant.bits[0],
+                            &SemanticsProfile::HLSL,
+                        );
+                        self.load_scalar(target.kind, bits)
+                    }
+                    None => self.expression(source),
+                };
+                texts.push(text);
+            }
+            return format!("{}({})", expression.ty, texts.join(", "));
+        }
+        // Typed literals (1e-40f, 0x1u, 2.5L) too, or DXC would fold them with compile-time rules
+        if let BoundExpressionKind::Literal(value) = &expression.kind
+            && !value.kind_at(0).is_literal()
+        {
+            return self.load_value(value);
         }
         if let BoundExpressionKind::Conversion { operand, .. } = &expression.kind
             && let ShaderType::Numeric(target) = &expression.ty
@@ -308,6 +342,19 @@ impl HlslEmitter {
             return self.load_value(&constant);
         }
         self.base_expression(expression)
+    }
+
+    /// Emits with the line's literals kept as literals (arguments DXC lowers differently when constant).
+    fn without_loads(&mut self, emit: impl FnOnce(&mut HlslEmitter) -> String) -> String {
+        let was_emitting_line: bool = self.harness.as_ref().is_some_and(|harness| harness.is_emitting_line);
+        if let Some(harness) = self.harness.as_mut() {
+            harness.is_emitting_line = false;
+        }
+        let text: String = emit(self);
+        if let Some(harness) = self.harness.as_mut() {
+            harness.is_emitting_line = was_emitting_line;
+        }
+        text
     }
 
     /// The node itself; its children go through `expression`.
