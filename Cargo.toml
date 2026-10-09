@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["crates/shadercalc-core", "crates/shadercalc-backend", "crates/shadercalc-devserver", "app/src-tauri"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"

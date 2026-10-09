@@ -1,0 +1,10 @@
+[package]
+name = "shadercalc-devserver"
+version = "0.1.0"
+edition.workspace = true
+description = "Serves ShaderCalc's backend commands over HTTP, for running the UI in a browser during development"
+
+[dependencies]
+shadercalc-backend = { path = "../shadercalc-backend" }
+serde_json = "1"
+tiny_http = "0.12"

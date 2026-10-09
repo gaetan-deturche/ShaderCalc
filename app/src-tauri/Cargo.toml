@@ -1,0 +1,14 @@
+[package]
+name = "shadercalc"
+version = "0.1.0"
+edition.workspace = true
+description = "ShaderCalc: HLSL worksheets checked against DXC + WARP"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+shadercalc-backend = { path = "../../crates/shadercalc-backend" }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-window-state = "2"

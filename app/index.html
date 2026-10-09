@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ShaderCalc</title>
+  </head>
+  <body>
+    <div id="app">
+      <main class="workspace">
+        <section class="documents">
+          <div class="toolbar">
+            <button id="new-button" title="New worksheet (Ctrl+T)">New</button>
+            <button id="rename-button" title="Rename the worksheet (F2)">Rename</button>
+            <button id="delete-button" title="Send the worksheet to the Recycle Bin">Delete</button>
+            <button id="folder-button" title="Show the worksheet files in Explorer">Open folder</button>
+          </div>
+          <div class="tabs" id="tabs" role="tablist"></div>
+          <div class="editors" id="editors"></div>
+        </section>
+        <div class="splitter vertical" id="side-splitter"></div>
+        <aside class="side" id="side">
+          <div class="side-tabs" role="tablist">
+            <button class="side-tab active" data-panel="inspector" id="inspector-tab">Inspector</button>
+            <button class="side-tab" data-panel="docs" id="docs-tab">Docs</button>
+          </div>
+          <div class="panel" id="inspector"></div>
+          <div class="panel docs hidden" id="docs">
+            <input id="docs-search" type="search" placeholder="Search the reference" spellcheck="false"
+              title="Search the reference: intrinsics, units, worksheet rules (F1 on a name opens its page)" />
+            <div class="docs-list" id="docs-list" role="listbox"></div>
+            <div class="splitter horizontal" id="docs-splitter"></div>
+            <div class="docs-page" id="docs-page"></div>
+          </div>
+        </aside>
+      </main>
+      <footer class="status">
+        <span id="status">Starting…</span>
+        <span id="reference-status"></span>
+        <span id="folder" class="dim"></span>
+      </footer>
+    </div>
+    <dialog id="dialog">
+      <form method="dialog">
+        <p id="dialog-message"></p>
+        <input id="dialog-input" spellcheck="false" />
+        <div class="dialog-buttons">
+          <button id="dialog-ok" value="ok">OK</button>
+          <button id="dialog-cancel" value="cancel" formnovalidate>Cancel</button>
+        </div>
+      </form>
+    </dialog>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
