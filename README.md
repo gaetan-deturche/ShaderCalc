@@ -1,41 +1,50 @@
-# <img src="src/KalkGui/Assets/kalkgui.png" width="48" align="top" alt=""> KalkGui
+# <img src="src/ShaderCalc.App/Assets/shadercalc.png" width="48" align="top" alt=""> ShaderCalc
 
-A Windows desktop front end for [kalk](https://github.com/xoofx/kalk), the developer calculator with
-HLSL-style vectors and matrices, unit conversions, user functions and bit-pattern display.
-The kalk engine runs unmodified inside the app.
+A Windows desktop worksheet for checking shader maths. Paste HLSL (or plain C++ math) functions, call them on
+the lines below, and every line shows its result, checked against a real HLSL compiler and GPU executor.
 
-- Transcript with kalk's syntax colours. `display dev` shows hex and binary breakdowns.
-- Input editor: Enter evaluates, Shift+Enter adds a new line, Tab / Ctrl+Space complete, Up/Down browse
-  history, F1 opens the docs for the word under the caret, Esc cancels a long evaluation (and, from any other
-  control, returns to the input).
-- Syntax help, in the input and in the Library editor:
-  - Enter after `func name(x)` / `if` / `for` / `while` opens the block and adds its `end`. Enter inside a
-    block adds a line, Enter on the last line evaluates, and Ctrl+Enter evaluates from anywhere.
-  - `func`, `if`, `for` or `while` followed by Tab expands to a template: Tab moves between the fields, and
-    the parameter name is mirrored into the body.
-  - The text is parsed as you type: the first syntax error is underlined and explained before you evaluate.
-- **Docs**: every documented function, including those in modules not imported yet, plus a Language section
-  (keywords, operators, syntax). It comes from kalk's own guides, with a KalkGui supplement for what kalk leaves
-  undocumented (bitwise `&` `|` `<<` `>>`, the missing xor/`~`, `+=`/`++`, bit functions). Search ranks names and
-  keywords first, so `func`, `<<` or `??` find their section; F1 works on keywords and operators too.
-- **Library**: every variable and function you define is saved to `~/.kalk/library.kalk` (with the modules
-  it needs) and available immediately, now and on every later start. Select an entry to edit it in place
-  (renaming replaces it) or use New to add one from a template (variable, one-line function, multi-line
-  function). Edits made to `library.kalk` outside the app apply live.
-  Entries that fail to load stay in the file, flagged, until you fix or delete them. Definitions from
-  `config.kalk` are listed but stay in `config.kalk`.
-- **Config**: edit `~/.kalk/config.kalk`, save it and restart the engine.
+```hlsl
+float KineticEnergy(float m, float v) { return 0.5 * m * v * v; }
+KineticEnergy(2 kg, 3 m/s)                 // ✓ 9 kg·m²/s² (J)
+float3 n = normalize(float3(1, 2, 3))      // ✓ float3(0.26726124, 0.5345225, 0.8017837)
+asuint(n.x)                                // ✓ 1049155191
+tanh(100.0)                                // ≠ 1 (WARP gives NaN)
+```
+
+- **Worksheet**: each tab is an `.hlsl` file, and all tabs form one program, like headers included in tab order.
+  Functions, structs, `#define`s and globals are shared; top-level lines run in order and show their value on
+  the right. A line break ends a line. Results update as you type.
+- **HLSL semantics**: a custom interpreter computes what DXC + WARP compute: 64-bit literals until they meet a
+  type, denormal flushing, unfused `mad`, masked shift counts, round-half-even, DXC's lowering of intrinsics
+  (`pow`, `smoothstep`, `normalize`, `fmod`, ...). Scalars (incl. `int64`/`double`), vectors, matrices,
+  arrays, structs and about 70 intrinsics.
+- **Reference check**: every line is also compiled by DXC and run on Direct3D 12's WARP adapter, then compared
+  bit by bit: `✓` identical, `≈` within tolerance on functions GPUs approximate, `≠` different.
+- **Units**: `3 km`, `9.81 m/s^2`, `100 cd` follow the value through every operation; mismatches are reported
+  where they happen.
+- **Bits**: the inspector shows each component's type, value, hex and bit pattern, the problems on the line
+  and the reference verdict.
+- **Docs**: F1 on a name opens its page (signature, DXC lowering, WARP behaviour); the Docs tab searches them.
+
+Worksheets live in `~/.shadercalc` (one `.hlsl` per tab, edits made outside the app reload live).
 
 ## Build
 
 ```
-git clone --recurse-submodules <repo>
-dotnet build KalkGui.sln
+dotnet build ShaderCalc.sln
+dotnet test tests/ShaderCalc.Tests
 ```
 
-Requires the .NET 9 SDK (pinned in `global.json`).
+Requires the .NET 9 SDK (pinned in `global.json`) and Windows 10/11 (WARP ships with Windows).
+
+Single-file exe:
+
+```
+dotnet publish src/ShaderCalc.App -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
+```
 
 ## Credits
 
-kalk is by Alexandre Mutel and released under the BSD-2-Clause license (`external/kalk/license.txt`).
-The KalkGui icon is kalk's icon with window caption buttons added to its title bar.
+`third_party/kalk/units.kalk` comes from [kalk](https://github.com/xoofx/kalk) by Alexandre Mutel
+(BSD-2-Clause, `third_party/kalk/license.txt`). DXC via [Vortice.Windows](https://github.com/amerkoleci/Vortice.Windows),
+editor by [AvalonEdit](https://github.com/icsharpcode/AvalonEdit).

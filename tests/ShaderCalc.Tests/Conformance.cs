@@ -100,7 +100,7 @@ public static class Conformance
 
         // Interpreter
         DiagnosticBag bag = new DiagnosticBag();
-        Evaluator evaluator = new Evaluator(session.Profile, new EvaluationOptions(), new Dictionary<VariableSymbol, Value>(), bag, "program", "input");
+        Evaluator evaluator = new Evaluator(session.Profile, new EvaluationOptions(), new Dictionary<VariableSymbol, Value>(), bag, "input");
         List<Value> ours = samples.Select(sample => evaluator.Call(function, sample.Select((input, index) =>
             evaluator.ConvertValue(input, function.Parameters[index].Type, ConversionKind.Numeric)).ToArray())).ToList();
 

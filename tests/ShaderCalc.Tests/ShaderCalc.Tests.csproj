@@ -19,7 +19,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\ShaderCalc\ShaderCalc.csproj" />
+    <ProjectReference Include="..\..\src\ShaderCalc.Core\ShaderCalc.Core.csproj" />
   </ItemGroup>
 
 </Project>
