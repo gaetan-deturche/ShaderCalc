@@ -110,3 +110,59 @@ fn lines_match_the_reference_from_their_inputs() {
         );
     }
 }
+
+fn run_with_libraries(documents: &[(&str, &str)]) -> WorksheetResult {
+    let documents: Vec<WorksheetDocument> =
+        documents.iter().map(|(name, text)| WorksheetDocument::new(*name, *text)).collect();
+    worksheet::evaluate_with_libraries(
+        "scratch.hlsl",
+        &documents,
+        &SemanticsProfile::HLSL,
+        &EvaluationOptions::default(),
+    )
+    .expect("not cancelled")
+}
+
+fn errors_of(result: &WorksheetResult, document: &str) -> Vec<String> {
+    result
+        .diagnostics_of(document)
+        .filter(|diagnostic| diagnostic.is_error())
+        .map(|diagnostic| diagnostic.message.clone())
+        .collect()
+}
+
+#[test]
+fn the_scratch_pad_sees_every_library() {
+    let result: WorksheetResult = run_with_libraries(&[
+        ("scratch.hlsl", "Twice(Square(3))\nSCALE * 2"),
+        ("square.hlsl", "#define SCALE 5\nfloat Square(float x) { return x * x; }\nSquare(4)"),
+        ("twice.hlsl", "float Twice(float x) { return 2 * x; }"),
+    ]);
+    assert_eq!(vec!["1: 18", "2: 10"], shown(&result, "scratch.hlsl"));
+    // A library's own lines run on their own, and once only
+    assert_eq!(vec!["3: 16"], shown(&result, "square.hlsl"));
+    assert!(result.diagnostics.iter().all(|diagnostic| !diagnostic.is_error()), "{:?}", result.diagnostics);
+}
+
+#[test]
+fn a_library_stands_alone() {
+    let result: WorksheetResult = run_with_libraries(&[
+        ("scratch.hlsl", "Quad(2)"),
+        ("square.hlsl", "float Square(float x) { return x * x; }"),
+        ("quad.hlsl", "float Quad(float x) { return Square(Square(x)); }"),
+        ("other.hlsl", "float Square(float y) { return y; }"),
+    ]);
+    // It runs in the scratch pad, where every library is included...
+    assert_eq!(1, result.lines_of("scratch.hlsl").count());
+    // ...but quad.hlsl needs square.hlsl, and two libraries define Square
+    assert!(
+        errors_of(&result, "quad.hlsl").iter().any(|message| message.contains("Square")),
+        "{:?}",
+        result.diagnostics
+    );
+    assert!(
+        errors_of(&result, "other.hlsl").iter().any(|message| message.contains("already")),
+        "{:?}",
+        result.diagnostics
+    );
+}

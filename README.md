@@ -11,9 +11,10 @@ asuint(n.x)                                // ✓ 1049155191
 tanh(7.0)                                  // ⊘ 0.99999833 (WARP's tanh is off: 1.0364964)
 ```
 
-- **Worksheet**: each tab is an `.hlsl` file, and all tabs form one program, like headers included in tab order.
-  Functions, structs, `#define`s and globals are shared; top-level lines run in order and show their value on
-  the right. A line break ends a line. Results update as you type.
+- **Worksheet**: each tab is an `.hlsl` file. The first, `scratch`, is a scratch pad whose lines show their value
+  on the right; the other tabs are libraries it sees, as if included in front of it. Each library also runs on its
+  own, so its own lines are local tests and a dependency on another library shows up as an error. A line break
+  ends a line. Results update as you type.
 - **HLSL semantics**: a custom interpreter computes what DXC + WARP compute: 64-bit literals until they meet a
   type, denormal flushing, unfused `mad`, masked shift counts, round-half-even, DXC's lowering of intrinsics
   (`pow`, `smoothstep`, `normalize`, `fmod`, ...). Scalars (incl. `int64`/`double`), vectors, matrices,

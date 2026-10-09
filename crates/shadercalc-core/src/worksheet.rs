@@ -190,6 +190,43 @@ pub fn evaluate(
     })
 }
 
+/// A scratch pad and its libraries: the scratch pad runs with every other document in front of it, as if included
+/// in order, and only its own lines and problems come from that run. Each library also runs on its own, so its lines
+/// are local tests and anything it takes from another library is an error there; problems only the combination
+/// has (two libraries defining the same name) are added to it. Without the scratch pad, this is `evaluate`.
+pub fn evaluate_with_libraries(
+    scratch: &str,
+    documents: &[WorksheetDocument],
+    profile: &SemanticsProfile,
+    options: &EvaluationOptions,
+) -> Result<WorksheetResult, Cancelled> {
+    let is_scratch = |document: &WorksheetDocument| document.name.eq_ignore_ascii_case(scratch);
+    let Some(scratch_document) = documents.iter().find(|document| is_scratch(document)) else {
+        return evaluate(documents, profile, options);
+    };
+    let libraries: Vec<&WorksheetDocument> = documents.iter().filter(|document| !is_scratch(document)).collect();
+    let mut combined_documents: Vec<WorksheetDocument> = libraries.iter().map(|library| (*library).clone()).collect();
+    combined_documents.push(scratch_document.clone());
+    let combined: WorksheetResult = evaluate(&combined_documents, profile, options)?;
+
+    let mut duration: Duration = combined.duration;
+    let mut lines: Vec<WorksheetLine> = Vec::new();
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    lines.extend(combined.lines.iter().filter(|line| line.document == scratch_document.name).cloned());
+    diagnostics.extend(combined.diagnostics_of(&scratch_document.name).cloned());
+    for library in libraries {
+        let alone: WorksheetResult = evaluate(std::slice::from_ref(library), profile, options)?;
+        duration += alone.duration;
+        lines.extend(alone.lines);
+        for diagnostic in alone.diagnostics.iter().chain(combined.diagnostics_of(&library.name)) {
+            if !diagnostics.contains(diagnostic) {
+                diagnostics.push(diagnostic.clone());
+            }
+        }
+    }
+    Ok(WorksheetResult { program: combined.program, lines, diagnostics, duration })
+}
+
 fn parse(
     documents: &[WorksheetDocument],
     is_unit_name: &dyn Fn(&str) -> bool,

@@ -136,6 +136,11 @@ button:hover {
   background: var(--button-hover);
 }
 
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 input {
   font: inherit;
   color: var(--text);
@@ -201,6 +206,12 @@ select {
 .tab.active {
   background: var(--editor-bg);
   border-color: var(--border);
+}
+
+/* The scratch pad, set apart from its libraries */
+.tab.scratch {
+  font-weight: 600;
+  margin-right: 10px;
 }
 
 .editors {

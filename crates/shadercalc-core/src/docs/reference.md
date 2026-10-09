@@ -1,9 +1,10 @@
 <!-- group: Worksheet -->
 ## Worksheet
-Each tab is an `.hlsl` file in the data folder. All tabs form one program, like headers included in tab order:
+Each tab is an `.hlsl` file in the data folder. The first tab, `scratch`, is the scratch pad; the others are libraries:
 
-- Functions, structs, `typedef`s, `#define`s and `cbuffer`s are shared by every tab and can be used before they are declared.
-- Top-level lines run in tab order, then top to bottom. A line break ends a line (no `;` needed) unless a bracket is still open.
+- The scratch pad sees every library, as if they were included in front of it in tab order: their functions, structs, `typedef`s, `#define`s, `cbuffer`s and globals can be used there.
+- Each library also runs on its own: its top-level lines are local tests, and anything it takes from another library is an error in its tab (libraries are meant to stand alone). A name two libraries define is an error too.
+- Functions and structs can be used before they are declared. A line break ends a line (no `;` needed) unless a bracket is still open.
 - A line shows its value on the right: an expression, an assignment, or the variable a declaration creates.
 - Variables created at the top level (`float3 n = ...`, or `x = 3` for a new name) are globals: later lines and functions can read them.
 - An error stays on its line; the lines after it still run.

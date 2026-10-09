@@ -57,9 +57,13 @@ component is raw `u64` bits plus a `UnitTag`).
 - Parity with the C# version: `values.rs` reproduces .NET's `"R"` float formatting, `as` casts saturate like .NET 9,
   `exp2` is `powf(2, x)` (.NET `float.Exp2`), HLSL's `f16tof32` comes from the `half` crate.
 
-## Worksheet (`worksheet::evaluate`)
+## Worksheet (`worksheet::evaluate`, `evaluate_with_libraries`)
 
-- All tabs are one program in tab order. Declarations are hoisted; top-level lines run in order.
+- `scratch.hlsl` is the scratch pad (pinned first tab: no rename, no delete, recreated if missing); the other tabs
+  are libraries. `evaluate_with_libraries` runs libraries + scratch as one program and keeps only the scratch's
+  lines and problems, then runs each library alone (its lines, its errors), adding the problems only the
+  combination has (a name two libraries define).
+- `evaluate`: documents as one program in order. Declarations are hoisted; top-level lines run in order.
 - A newline ends a top-level statement unless a bracket is open (`Parser::at_line_break`).
 - A top-level variable (declared, or `x = v` for a new name) is a global that functions can read.
 - Each line gets its own evaluator over shared storage, its own diagnostics, and a snapshot of the globals it
@@ -90,7 +94,8 @@ component is raw `u64` bits plus a `UnitTag`).
 
 ## App
 
-- `store.rs`: every `*.hlsl` in `~/.shadercalc` (or `SHADERCALC_DATA_DIR`) is a tab. `state.json` holds the tab
+- `store.rs`: every `*.hlsl` in `~/.shadercalc` (or `SHADERCALC_DATA_DIR`) is a tab, `scratch.hlsl` first (`SCRATCH`,
+  refused by `rename`/`delete`, recreated by `open` and `outside_changes`). `state.json` holds the tab
   order, the active tab, the panel widths and the profile id (PascalCase keys, like the C# app). Writes go to a `.tmp` file
   and are renamed into place. Delete sends the file to the Recycle Bin (`trash`). Outside edits are found by
   mtime + length; the frontend polls `pollChanges` every second.

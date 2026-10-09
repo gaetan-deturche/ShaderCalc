@@ -7,6 +7,8 @@ import { DocEntry, DocumentText, Evaluation, Line, LoadResult, OutsideChanges, P
 import { CompletionEntry, WorksheetView } from "./worksheet-view";
 
 const EXTENSION: string = ".hlsl";
+/** The scratch pad: always the first tab; the other tabs are its libraries. */
+const SCRATCH: string = "scratch.hlsl";
 
 const tabs: HTMLElement = document.getElementById("tabs") as HTMLElement;
 const editors: HTMLElement = document.getElementById("editors") as HTMLElement;
@@ -34,6 +36,10 @@ let profile: string = "hlsl";
 
 function displayName(name: string): string {
   return name.toLowerCase().endsWith(EXTENSION) ? name.slice(0, -EXTENSION.length) : name;
+}
+
+function isScratch(name: string): boolean {
+  return name.toLowerCase() === SCRATCH;
 }
 
 // ---------------------------------------------------------------- Dialogs
@@ -131,11 +137,13 @@ function renderTabs(): void {
   const fragment: DocumentFragment = document.createDocumentFragment();
   for (const view of views) {
     const tab: HTMLButtonElement = document.createElement("button");
-    tab.className = view === active ? "tab active" : "tab";
+    tab.className = (view === active ? "tab active" : "tab") + (isScratch(view.name) ? " scratch" : "");
     tab.setAttribute("role", "tab");
     tab.setAttribute("aria-selected", String(view === active));
     tab.textContent = displayName(view.name);
-    tab.title = view.name;
+    tab.title = isScratch(view.name)
+      ? "Scratch pad: its lines run with every library"
+      : `${view.name}: a library for the scratch pad (its own lines run on their own)`;
     tab.addEventListener("click", () => activate(view));
     tab.addEventListener("dblclick", () => void renameActive());
     fragment.append(tab);
@@ -149,6 +157,9 @@ function activate(view: WorksheetView | null): void {
   }
   active?.element.classList.add("hidden");
   active = view;
+  const isPinned: boolean = view !== null && isScratch(view.name);
+  (document.getElementById("rename-button") as HTMLButtonElement).disabled = isPinned;
+  (document.getElementById("delete-button") as HTMLButtonElement).disabled = isPinned;
   if (view !== null) {
     view.element.classList.remove("hidden");
     view.view.requestMeasure();
@@ -167,10 +178,10 @@ async function newWorksheet(): Promise<void> {
 
 async function renameActive(): Promise<void> {
   const view: WorksheetView | null = active;
-  if (view === null) {
+  if (view === null || isScratch(view.name)) {
     return;
   }
-  const title: string | null = await ask("Rename worksheet", displayName(view.name));
+  const title: string | null = await ask("Rename library", displayName(view.name));
   if (title === null) {
     view.focus();
     return;
@@ -190,7 +201,7 @@ async function renameActive(): Promise<void> {
 
 async function deleteActive(): Promise<void> {
   const view: WorksheetView | null = active;
-  if (view === null || !(await confirmAction(`Send ${view.name} to the Recycle Bin?`))) {
+  if (view === null || isScratch(view.name) || !(await confirmAction(`Send ${view.name} to the Recycle Bin?`))) {
     view?.focus();
     return;
   }

@@ -8,9 +8,16 @@ use serde::{Deserialize, Serialize};
 
 pub const EXTENSION: &str = ".hlsl";
 
-const WELCOME: &str = "// ShaderCalc: every line is HLSL, its value shows on the right.
-// Functions, structs and #defines are shared by every tab. Click a result for its bits,
-// units and the check against DXC + WARP. F1 on a name opens its documentation.
+/// The scratch pad: always the first tab; the other tabs are its libraries.
+pub const SCRATCH: &str = "scratch.hlsl";
+
+pub fn is_scratch(name: &str) -> bool {
+    key(name) == SCRATCH
+}
+
+const WELCOME: &str = "// ShaderCalc scratch pad: every line is HLSL, its value shows on the right.
+// The other tabs are libraries: their functions, structs and #defines can be used here.
+// Click a result for its bits, units and the check against DXC + WARP. F1 on a name opens its documentation.
 
 float KineticEnergy(float mass, float speed)
 {
@@ -108,7 +115,9 @@ impl WorksheetStore {
             .unwrap_or_default();
         let mut store: WorksheetStore = WorksheetStore { folder, state, known: HashMap::new() };
         if store.list_files()?.is_empty() {
-            store.write(&format!("scratch{EXTENSION}"), WELCOME)?;
+            store.write(SCRATCH, WELCOME)?;
+        } else if !store.path(SCRATCH).exists() {
+            store.write(SCRATCH, "")?;
         }
         Ok(store)
     }
@@ -129,7 +138,7 @@ impl WorksheetStore {
         Ok(names)
     }
 
-    /// Files in tab order: the saved order first, then new files by name.
+    /// Files in tab order: the scratch pad, the saved order, then new files by name.
     pub fn ordered_names(&self) -> io::Result<Vec<String>> {
         let files: Vec<String> = self.list_files()?;
         let mut ordered: Vec<String> = self
@@ -142,6 +151,7 @@ impl WorksheetStore {
             files.into_iter().filter(|file| !ordered.iter().any(|name| key(name) == key(file))).collect();
         rest.sort_by_key(|name| key(name));
         ordered.extend(rest);
+        ordered.sort_by_key(|name| !is_scratch(name));
         Ok(ordered)
     }
 
@@ -186,9 +196,15 @@ impl WorksheetStore {
 
     /// Renames a worksheet; returns the new file name, or why it can't.
     pub fn rename(&mut self, name: &str, new_title: &str) -> Result<String, String> {
+        if is_scratch(name) {
+            return Err("The scratch pad keeps its name.".to_string());
+        }
         let mut new_name: String = new_title.trim().to_string();
         if !new_name.to_lowercase().ends_with(EXTENSION) {
             new_name.push_str(EXTENSION);
+        }
+        if is_scratch(&new_name) {
+            return Err(format!("{SCRATCH} is the scratch pad's name."));
         }
         const INVALID: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
         if new_name.len() <= EXTENSION.len()
@@ -209,6 +225,9 @@ impl WorksheetStore {
 
     /// Sends a worksheet to the Recycle Bin.
     pub fn delete(&mut self, name: &str) -> Result<(), String> {
+        if is_scratch(name) {
+            return Err("The scratch pad can't be deleted.".to_string());
+        }
         trash::delete(self.path(name)).map_err(|error| error.to_string())?;
         self.known.remove(&key(name));
         Ok(())
@@ -216,6 +235,10 @@ impl WorksheetStore {
 
     /// Compares the folder with what the app last saw.
     pub fn outside_changes(&mut self) -> io::Result<OutsideChanges> {
+        // The scratch pad always exists: deleted outside, it comes back empty
+        if !self.path(SCRATCH).exists() {
+            fs::write(self.path(SCRATCH), "")?;
+        }
         let files: Vec<String> = self.list_files()?;
         let mut changes: OutsideChanges = OutsideChanges::default();
         for name in &files {

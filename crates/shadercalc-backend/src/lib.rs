@@ -188,7 +188,7 @@ impl Backend {
             documents.into_iter().map(|document| WorksheetDocument::new(document.name, document.text)).collect();
         let options: EvaluationOptions =
             EvaluationOptions { cancellation: Some(cancellation), ..EvaluationOptions::default() };
-        let Ok(result) = worksheet::evaluate(&documents, profile, &options) else {
+        let Ok(result) = worksheet::evaluate_with_libraries(store::SCRATCH, &documents, profile, &options) else {
             return Ok(json!({ "cancelled": true }));
         };
         if self.generation.load(Ordering::SeqCst) != generation {
