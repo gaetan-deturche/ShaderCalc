@@ -2,10 +2,10 @@ import "./styles.css";
 import { appCommand, call, isTauri } from "./api";
 import { DocsPanel } from "./docs";
 import { COMMON_TYPES, KEYWORDS } from "./hlsl";
-import { buildInspector, emptyInspector } from "./inspector";
+import { buildInspector, buildTraceInspector, emptyInspector } from "./inspector";
 import { insertionOf, LibraryPanel } from "./library";
 import { DocEntry, DocumentText, Evaluation, Export, Line, LoadResult, OutsideChanges, Profile, Reference, UpdateInfo } from "./types";
-import { CompletionEntry, WorksheetView } from "./worksheet-view";
+import { CompletionEntry, TraceFocus, WorksheetView } from "./worksheet-view";
 
 const EXTENSION: string = ".hlsl";
 /** The scratch pad: always the first tab; the other tabs are its libraries. */
@@ -318,7 +318,7 @@ async function runReferences(evaluation: Evaluation): Promise<void> {
   const order: string[] = views.map((view: WorksheetView) => view.name);
   const activeName: string | undefined = active?.name;
   const lines: Line[] = evaluation.lines
-    .filter((line: Line) => line.value !== null)
+    .filter((line: Line) => line.value !== null || (line.trace?.entries.length ?? 0) > 0)
     .sort((left: Line, right: Line) => {
       const rank = (line: Line): number => (line.document === activeName ? -1 : order.indexOf(line.document));
       return rank(left) - rank(right) || left.line - right.line;
@@ -342,6 +342,7 @@ async function runReferences(evaluation: Evaluation): Promise<void> {
         hlsl: "",
         referenceValue: null,
         timings: null,
+        trace: [],
       };
     }
     if (reference === null || evaluation.generation !== latestGeneration) {
@@ -380,7 +381,14 @@ function onLineSelected(view: WorksheetView): void {
     return;
   }
   const line: Line | null = view.selectedLine;
-  inspector.replaceChildren(line === null ? emptyInspector() : buildInspector(line, view.sourceOf(line), view.referenceFor(line)));
+  const focus: TraceFocus | null = line === null ? null : view.traceFocus();
+  inspector.replaceChildren(
+    line === null
+      ? emptyInspector()
+      : focus !== null
+        ? buildTraceInspector(focus, view.referenceFor(line), (entry: number) => view.chooseEntry(focus.index, entry))
+        : buildInspector(line, view.sourceOf(line), view.referenceFor(line)),
+  );
 }
 
 // ---------------------------------------------------------------- Side panel

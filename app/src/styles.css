@@ -309,6 +309,24 @@ select {
   color: var(--dim);
 }
 
+/* A loop's iteration stepper */
+.result-row .step {
+  flex: none;
+  padding: 0 5px;
+  color: var(--accent);
+  cursor: pointer;
+  user-select: none;
+}
+
+.result-row .step:hover {
+  background: var(--button-hover);
+  border-radius: 3px;
+}
+
+.result-row .text.dim {
+  color: var(--dim);
+}
+
 /* ---- CodeMirror ---- */
 /* .editor-host in front: CodeMirror's own theme rules carry a generated class (.ͼ2 .cm-gutters) and would win */
 
@@ -529,6 +547,38 @@ table.components tr.error td {
 
 table.components tr.dim td {
   color: var(--dim);
+}
+
+/* Every iteration of a traced statement */
+table.iterations {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+table.iterations th {
+  text-align: left;
+  font-weight: normal;
+  color: var(--dim);
+  padding: 2px 8px 2px 2px;
+}
+
+table.iterations td {
+  padding: 2px 8px 2px 2px;
+  white-space: nowrap;
+}
+
+table.iterations tbody tr {
+  cursor: pointer;
+}
+
+table.iterations tbody tr:hover {
+  background: var(--button-hover);
+}
+
+table.iterations tbody tr.selected {
+  background: var(--selected-line);
 }
 
 /* Bits: groups of 4 under their top bit's index */

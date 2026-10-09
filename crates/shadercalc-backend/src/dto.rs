@@ -3,6 +3,7 @@ use shadercalc_core::diagnostics::{Diagnostic, DiagnosticSeverity};
 use shadercalc_core::docs::DocEntry;
 use shadercalc_core::exports::Export;
 use shadercalc_core::reference::checker::{ReferenceOutcome, ReferenceVerdict};
+use shadercalc_core::trace::{LineTrace, TracePointKind};
 use shadercalc_core::types::{ScalarKind, ShaderType};
 use shadercalc_core::units::Dimension;
 use shadercalc_core::values::{Value, describe_dimension, format_component};
@@ -247,6 +248,71 @@ pub struct LineDto {
     pub to: usize,
     pub value: Option<ValueDto>,
     pub diagnostics: Vec<DiagnosticDto>,
+    pub trace: Option<TraceDto>,
+}
+
+/// A statement of a line's loops/ifs/blocks (`kind` "value") or a loop ("loop", with its variables' names).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TracePointDto {
+    pub kind: &'static str,
+    pub first_line: usize,
+    pub last_line: usize,
+    /// Enclosing loops (point indices), outermost first.
+    pub loops: Vec<usize>,
+    pub variables: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceEntryDto {
+    pub point: usize,
+    pub iterations: Vec<u32>,
+    pub values: Vec<ValueDto>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceDto {
+    pub points: Vec<TracePointDto>,
+    pub entries: Vec<TraceEntryDto>,
+    pub is_truncated: bool,
+}
+
+impl From<&LineTrace> for TraceDto {
+    fn from(trace: &LineTrace) -> TraceDto {
+        TraceDto {
+            points: trace
+                .points
+                .iter()
+                .map(|point| {
+                    let (kind, variables) = match &point.kind {
+                        TracePointKind::Value { .. } => ("value", Vec::new()),
+                        TracePointKind::Loop { variables } => {
+                            ("loop", variables.iter().map(|variable| variable.name.clone()).collect())
+                        }
+                    };
+                    TracePointDto {
+                        kind,
+                        first_line: point.first_line,
+                        last_line: point.last_line,
+                        loops: point.loops.clone(),
+                        variables,
+                    }
+                })
+                .collect(),
+            entries: trace
+                .entries
+                .iter()
+                .map(|entry| TraceEntryDto {
+                    point: entry.point,
+                    iterations: entry.iterations.clone(),
+                    values: entry.values.iter().map(ValueDto::from).collect(),
+                })
+                .collect(),
+            is_truncated: trace.is_truncated,
+        }
+    }
 }
 
 impl LineDto {
@@ -260,6 +326,7 @@ impl LineDto {
             to: line.span.end(),
             value: line.value().map(ValueDto::from),
             diagnostics: line.result.diagnostics.iter().map(DiagnosticDto::from).collect(),
+            trace: line.result.trace.as_ref().map(TraceDto::from),
         }
     }
 }
@@ -332,18 +399,31 @@ pub struct ReferenceDto {
     pub hlsl: String,
     pub reference_value: Option<ValueDto>,
     pub timings: Option<TimingsDto>,
+    /// A traced line: each entry's verdict, with the reference's values when they differ.
+    pub trace: Vec<TraceCheckDto>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceCheckDto {
+    pub verdict: &'static str,
+    pub values: Vec<ValueDto>,
+}
+
+fn verdict_name(verdict: ReferenceVerdict) -> &'static str {
+    match verdict {
+        ReferenceVerdict::Match => "match",
+        ReferenceVerdict::WithinTolerance => "withinTolerance",
+        ReferenceVerdict::Mismatch => "mismatch",
+        ReferenceVerdict::WarpLimit => "warpLimit",
+        ReferenceVerdict::NotChecked => "notChecked",
+    }
 }
 
 impl From<&ReferenceOutcome> for ReferenceDto {
     fn from(outcome: &ReferenceOutcome) -> ReferenceDto {
         ReferenceDto {
-            verdict: match outcome.verdict {
-                ReferenceVerdict::Match => "match",
-                ReferenceVerdict::WithinTolerance => "withinTolerance",
-                ReferenceVerdict::Mismatch => "mismatch",
-                ReferenceVerdict::WarpLimit => "warpLimit",
-                ReferenceVerdict::NotChecked => "notChecked",
-            },
+            verdict: verdict_name(outcome.verdict),
             summary: outcome.to_string(),
             max_ulps: outcome.max_ulps,
             uses_approximations: outcome.uses_approximations,
@@ -355,6 +435,17 @@ impl From<&ReferenceOutcome> for ReferenceDto {
                 pipeline_ms: timings.pipeline_milliseconds,
                 run_ms: timings.run_milliseconds,
             }),
+            trace: outcome
+                .trace
+                .iter()
+                .map(|check| TraceCheckDto {
+                    verdict: verdict_name(check.verdict),
+                    values: match check.verdict {
+                        ReferenceVerdict::Match => Vec::new(),
+                        _ => check.values.iter().map(ValueDto::from).collect(),
+                    },
+                })
+                .collect(),
         }
     }
 }

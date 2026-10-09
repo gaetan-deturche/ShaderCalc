@@ -72,6 +72,12 @@ component is raw `u64` bits plus a `UnitTag`).
 - A top-level variable (declared, or `x = v` for a new name) is a global that functions can read.
 - Each line gets its own evaluator over shared storage, its own diagnostics, and a snapshot of the globals it
   starts from (`LineResult::inputs`, used by the reference). A line with bind errors isn't run.
+- Traces (`trace.rs`, `LineResult::trace`): `trace_points` numbers a line statement's nested value statements
+  (declarations, non-void non-literal expressions inside loop bodies/ifs/switches/scope blocks) and its loops in
+  pre-order, keyed by node address. The evaluator (`trace_line`) records each execution with the iteration of
+  every enclosing loop; a loop records its initializer's variables at each iteration start. The worksheet fills in
+  the points' lines. `MAX_TRACE_ENTRIES` (4,096) caps a line. The checker's emitter walks its own copy of the tree
+  with the same numbering (the interpreter's tree is a clone).
 
 ## Reference (`reference/`)
 
@@ -85,6 +91,10 @@ component is raw `u64` bits plus a `UnitTag`).
   their type, constructor components too), so DXC can't constant-fold the line. `Intrinsic::
   constant_sensitive_arguments` keeps arguments like `pow`'s exponent literal (DXC lowers a constant 2
   differently). The substitution applies only while emitting the line (`Harness::is_emitting_line`).
+- A traced line (`HarnessTrace`) writes every trace entry after the result in execution order: output = result
+  words, then the word count the shader wrote (`refTraceCursor`), then the entries. Stores are guarded by the
+  interpreter's count (`capacity`): the output is a root UAV, with no bounds check. Each entry gets its own verdict
+  (`ReferenceOutcome::trace`); the line's is the worst; a different count means the loops ran differently.
 - A shader that removes the WARP device (a double fma does) yields `ReferenceError::Crashed`; the dead device is
   dropped and recreated on the next run (D3D12 hands back the same device while any reference to it lives).
 - Verdicts: bit-identical `✓`; `≈` for approximate intrinsics within 64 ulp or 0.0008 absolute; `⊘` WarpLimit when
@@ -114,7 +124,11 @@ component is raw `u64` bits plus a `UnitTag`).
 - `inspector.ts`: type, units, per-component value/hex/bits, problems, the reference verdict and the emitted HLSL.
   Bits (`buildBits`): drawn from `ComponentDto::raw` (BigInt) with `width` and the float `fields` from the backend
   (`dto.rs` `float_layout`: half 1/5/10, float 1/8/23, double 1/11/52); groups of 4 labelled with their top bit,
-  a wider gap between bytes, 32 bits a row, fields coloured, bits that differ from WARP's marked. `docs.ts`: the docs panel (`marked`). `library.ts`: the Library panel from `evaluate`'s `exports`, grouped by
+  a wider gap between bytes, 32 bits a row, fields coloured, bits that differ from WARP's marked. Traces: `trace.ts` (`TraceIndex`: entry by
+  iteration path, iterations per loop, stepping) behind `WorksheetView`'s trace cells (each statement's value at
+  the chosen iterations, a ◀ ▶ stepper per loop, Alt+←/→), `IterationChoices` keyed by document + line + point so
+  they survive re-evaluation; `traceFocus` + `buildTraceInspector` list a statement's iterations (click =
+  choose). `docs.ts`: the docs panel (`marked`). `library.ts`: the Library panel from `evaluate`'s `exports`, grouped by
   library in tab order (re-rendered only when they change). Click → `WorksheetView.insertSnippet` in the scratch
   pad (a CodeMirror snippet, parameters as numbered fields; it replaces a partly typed name, stays inline in an
   expression or on a blank line, else goes on a new line); Ctrl+click → `goTo` the name's offset.

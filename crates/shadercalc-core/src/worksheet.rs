@@ -14,6 +14,7 @@ use crate::syntax::lexer::{Token, tokenize};
 use crate::syntax::parser::parse_worksheet;
 use crate::syntax::preprocessor::{MacroDefinition, Preprocessor};
 use crate::syntax::tree::{DeclarationSyntax, ExpressionKind, ItemSyntax, StatementKind};
+use crate::trace::LineTrace;
 use crate::units::UNITS;
 use crate::values::Value;
 
@@ -124,13 +125,16 @@ pub fn evaluate(
         }));
         let mut value: Option<Value> = None;
         let mut reference_limits: Vec<String> = Vec::new();
+        let mut trace: Option<LineTrace> = None;
         if !line_diagnostics.has_errors() {
             let outcome: Result<Option<Value>, Interrupt> = {
                 let mut evaluator: Evaluator =
                     Evaluator::new(profile, options, &mut storage, &mut line_diagnostics, &line.source);
                 evaluator.set_current_source(&line.source);
+                evaluator.trace_line(&line.statement);
                 let outcome: Result<Option<Value>, Interrupt> = evaluator.run_line(line);
                 reference_limits = evaluator.take_reference_limits();
+                trace = evaluator.take_trace();
                 outcome
             };
             match outcome {
@@ -170,6 +174,19 @@ pub fn evaluate(
             result_variable: shown_variable,
             declared_variables: line.declared.clone(),
         };
+        let last_line_of = |span: SourceSpan| -> usize {
+            match line_starts.get(line.source.as_str()) {
+                Some(starts) => line_of(starts, span.end().saturating_sub(1).max(span.offset)),
+                None => span.line,
+            }
+        };
+        let last_line: usize = last_line_of(line.span);
+        if let Some(trace) = trace.as_mut() {
+            for point in &mut trace.points {
+                point.first_line = point.span.line;
+                point.last_line = last_line_of(point.span);
+            }
+        }
         let result: LineResult = LineResult {
             value,
             diagnostics: line_diagnostics.into_items(),
@@ -178,10 +195,7 @@ pub fn evaluate(
             program: Some(bound.program.clone()),
             inputs,
             reference_limits,
-        };
-        let last_line: usize = match line_starts.get(line.source.as_str()) {
-            Some(starts) => line_of(starts, line.span.end().saturating_sub(1).max(line.span.offset)),
-            None => line.span.line,
+            trace,
         };
         lines.push(WorksheetLine { document: line.source.clone(), line: last_line, span: line.span, result });
     }

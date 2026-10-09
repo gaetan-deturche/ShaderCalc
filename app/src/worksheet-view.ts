@@ -14,7 +14,8 @@ import {
   ViewUpdate,
 } from "@codemirror/view";
 import { hlslHighlight, hlslLanguage } from "./hlsl";
-import { Diagnostic, Line, Reference, Severity } from "./types";
+import { IterationChoices, TraceIndex } from "./trace";
+import { Diagnostic, Line, Reference, Severity, TracePoint, Verdict } from "./types";
 
 /** A name the editor can complete: what it is (function, type...) and a description for the tooltip. */
 export interface CompletionEntry {
@@ -30,6 +31,18 @@ interface Cell {
   problem: Severity | null;
   details: string | null;
   line: Line | null;
+  /** Inside a traced line: the entry shown (null: didn't run in the chosen iteration), or a loop's stepper. */
+  trace?: { index: TraceIndex; entry: number | null; loop: number | null };
+  isDim?: boolean;
+}
+
+/** The trace point under the caret: what the Inspector lists. */
+export interface TraceFocus {
+  index: TraceIndex;
+  point: number;
+  /** The entry the chosen iterations select. */
+  entry: number | null;
+  source: string;
 }
 
 interface CellPosition {
@@ -47,7 +60,7 @@ export interface WorksheetHooks {
 }
 
 /** The mark in front of a result: problems first, then the reference verdict. */
-export function markOf(problem: Severity | null, reference: Reference | undefined, hasValue: boolean): { mark: string; kind: string } {
+export function markOf(problem: Severity | null, reference: { verdict: Verdict } | undefined, hasValue: boolean): { mark: string; kind: string } {
   if (problem === "error") {
     return { mark: "✗", kind: "error" };
   }
@@ -101,10 +114,15 @@ export class WorksheetView {
   private readonly results: HTMLElement;
   private readonly splitter: HTMLElement;
   private cells: Map<number, Cell> = new Map();
+  /** The cells of the lines themselves, before the traces' are added. */
+  private lineCells: Map<number, Cell> = new Map();
+  private traces: TraceIndex[] = [];
+  private readonly choices: IterationChoices = new Map();
   private lines: Line[] = [];
   private references: Map<number, Reference> = new Map();
   private positions: CellPosition[] = [];
   private selectedNumber: number = 0;
+  private caretLineShown: number = 0;
   private isReplacingText: boolean = false;
   private isLayoutPending: boolean = false;
 
@@ -157,7 +175,17 @@ export class WorksheetView {
       hlslLanguage(this.hooks.intrinsics),
       syntaxHighlighting(hlslHighlight),
       autocompletion({ override: [(context: CompletionContext) => this.complete(context)], activateOnTyping: true }),
-      keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, ...searchKeymap, ...completionKeymap, ...lintKeymap, indentWithTab]),
+      keymap.of([
+        { key: "Alt-ArrowLeft", run: () => this.stepAtCaret(-1) },
+        { key: "Alt-ArrowRight", run: () => this.stepAtCaret(1) },
+        ...closeBracketsKeymap,
+        ...defaultKeymap,
+        ...historyKeymap,
+        ...searchKeymap,
+        ...completionKeymap,
+        ...lintKeymap,
+        indentWithTab,
+      ]),
       EditorView.updateListener.of((update: ViewUpdate) => this.onUpdate(update)),
     ];
   }
@@ -257,7 +285,9 @@ export class WorksheetView {
         cells.set(diagnostic.line, { text: diagnostic.message, isProblemText: true, problem: diagnostic.severity, details: diagnostic.text, line: null });
       }
     }
-    this.cells = cells;
+    this.lineCells = cells;
+    this.traces = lines.flatMap((line: Line) => (line.trace !== null && line.trace.points.length > 0 ? [new TraceIndex(line, line.trace)] : []));
+    this.buildTraceCells();
 
     const length: number = this.view.state.doc.length;
     const marks: LintDiagnostic[] = diagnostics
@@ -303,7 +333,128 @@ export class WorksheetView {
 
   private markFor(cell: Cell): { mark: string; kind: string } {
     const reference: Reference | undefined = cell.line === null ? undefined : this.references.get(cell.line.index);
+    if (cell.trace !== undefined) {
+      // A loop's stepper carries the whole line's verdict; a value its own iteration's
+      if (cell.trace.loop !== null) {
+        return markOf(cell.problem, reference, true);
+      }
+      const verdict: Verdict | undefined = cell.trace.entry === null ? undefined : reference?.trace[cell.trace.entry]?.verdict;
+      return markOf(cell.problem, verdict === undefined ? undefined : { verdict }, cell.trace.entry !== null);
+    }
     return markOf(cell.problem, reference, cell.line?.value != null);
+  }
+
+  // ---- Traces (values inside a line's loops, ifs and blocks) ----
+
+  /** The line cells plus each traced statement's value at the chosen iterations, and each loop's stepper. */
+  private buildTraceCells(): void {
+    const cells: Map<number, Cell> = new Map(this.lineCells);
+    for (const index of this.traces) {
+      index.trace.points.forEach((point: TracePoint, id: number) => {
+        const cell: Cell = this.traceCell(index, point, id);
+        const number: number = point.kind === "loop" ? point.firstLine : point.lastLine;
+        const existing: Cell | undefined = cells.get(number);
+        if (existing === undefined || existing.isProblemText) {
+          cells.set(number, cell);
+        } else if (cell.trace?.loop !== null && existing.trace?.loop === null) {
+          // `for (...) x += i;` on one line: the stepper, then the value
+          cells.set(number, { ...cell, text: `${cell.text}  ·  ${existing.text}` });
+        } else {
+          existing.text += `  ·  ${cell.text}`;
+        }
+      });
+    }
+    this.cells = cells;
+  }
+
+  private traceCell(index: TraceIndex, point: TracePoint, id: number): Cell {
+    const entry: number | null = index.entryAt(id, this.choices);
+    const path: number[] | null = index.path(id, this.choices);
+    const truncated: string = index.trace.isTruncated ? "\n(only the first values the loops computed are kept)" : "";
+    if (point.kind === "loop") {
+      if (path === null) {
+        return { text: "no iteration", isProblemText: false, problem: null, details: `The loop didn't run${truncated}`, line: index.line, trace: { index, entry, loop: id }, isDim: true };
+      }
+      const count: number = index.iterationCount(id, path.slice(0, -1));
+      const own: string =
+        entry === null ? "" : point.variables.map((name: string, at: number) => `${name} = ${index.trace.entries[entry].values[at]?.text ?? "?"}`).join(", ");
+      const all: string = index.loopVariables([...point.loops, id], path);
+      return {
+        text: `${own}${own ? " · " : ""}${path[path.length - 1] + 1}/${count}`,
+        isProblemText: false,
+        problem: null,
+        details: `Iteration ${path[path.length - 1] + 1} of ${count}${all ? `: ${all}` : ""}\n◀ ▶, or Alt+← / Alt+→ with the caret in the loop, pick another${truncated}`,
+        line: index.line,
+        trace: { index, entry, loop: id },
+      };
+    }
+    if (entry === null) {
+      const where: string = path === null ? "" : ` (${index.loopVariables(point.loops, path)})`;
+      return { text: "–", isProblemText: false, problem: null, details: `Not run in this iteration${where}${truncated}`, line: index.line, trace: { index, entry, loop: null }, isDim: true };
+    }
+    const value: string = index.trace.entries[entry].values[0]?.text ?? "";
+    const where: string = path === null || path.length === 0 ? "" : `\n${index.loopVariables(point.loops, path)}`;
+    return { text: value, isProblemText: false, problem: null, details: `${value}${where}${truncated}`, line: index.line, trace: { index, entry, loop: null } };
+  }
+
+  /** After the chosen iterations changed: the cells and the Inspector follow. */
+  private refreshTrace(): void {
+    this.buildTraceCells();
+    this.scheduleLayout();
+    this.hooks.onSelect(this);
+  }
+
+  /** Alt+← / Alt+→: another iteration of the innermost loop around the caret. */
+  private stepAtCaret(delta: number): boolean {
+    const lineNumber: number = this.caretLine();
+    for (const index of this.traces) {
+      const loop: number | null = index.loopAt(lineNumber);
+      if (loop !== null) {
+        if (index.step(loop, delta, this.choices)) {
+          this.refreshTrace();
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private stepLoopAtLine(lineNumber: number, delta: number): void {
+    const cell: Cell | undefined = this.cells.get(lineNumber);
+    if (cell?.trace?.loop != null && cell.trace.index.step(cell.trace.loop, delta, this.choices)) {
+      this.refreshTrace();
+    }
+  }
+
+  /** The traced statement on the caret's line, else the innermost loop around it. */
+  traceFocus(): TraceFocus | null {
+    const lineNumber: number = this.caretLine();
+    for (const index of this.traces) {
+      if (lineNumber < index.line.firstLine || lineNumber > index.line.line) {
+        continue;
+      }
+      let point: number = index.trace.points.findIndex(
+        (candidate: TracePoint) => candidate.kind === "value" && candidate.firstLine <= lineNumber && lineNumber <= candidate.lastLine,
+      );
+      if (point < 0) {
+        point = index.loopAt(lineNumber) ?? -1;
+      }
+      if (point < 0) {
+        return null;
+      }
+      const target: TracePoint = index.trace.points[point];
+      const doc = this.view.state.doc;
+      const last: number = Math.min(target.kind === "loop" ? target.firstLine : target.lastLine, doc.lines);
+      const source: string = doc.sliceString(doc.line(Math.min(target.firstLine, doc.lines)).from, doc.line(last).to);
+      return { index, point, entry: index.entryAt(point, this.choices), source };
+    }
+    return null;
+  }
+
+  /** The Inspector picked an entry: show its iterations everywhere. */
+  chooseEntry(index: TraceIndex, entry: number): void {
+    index.choose(entry, this.choices);
+    this.refreshTrace();
   }
 
   private caretLine(): number {
@@ -315,12 +466,16 @@ export class WorksheetView {
       this.lines.find((candidate: Line) => candidate.line === number) ??
       this.lines.find((candidate: Line) => candidate.firstLine <= number && number <= candidate.line) ??
       null;
-    const selectedNumber: number = line?.line ?? 0;
+    // In a traced line, the highlight follows the caret onto its statements' own results
+    const selectedNumber: number = line?.trace != null && this.cells.get(number)?.trace !== undefined ? number : (line?.line ?? 0);
     if (selectedNumber !== this.selectedNumber) {
       this.selectedNumber = selectedNumber;
       this.scheduleLayout();
     }
-    if (force || line?.index !== this.selectedLine?.index) {
+    // Inside a traced line, each statement has its own Inspector page
+    const movedInTrace: boolean = line?.trace != null && number !== this.caretLineShown;
+    this.caretLineShown = number;
+    if (force || line?.index !== this.selectedLine?.index || movedInTrace) {
       this.selectedLine = line;
       this.hooks.onSelect(this);
     }
@@ -392,9 +547,21 @@ export class WorksheetView {
         markElement.className = `mark ${kind}`;
         markElement.textContent = mark;
         const textElement: HTMLElement = document.createElement("span");
-        textElement.className = cell.isProblemText ? `text ${cell.problem === "error" ? "error" : "warning"}` : "text value";
+        textElement.className = cell.isProblemText ? `text ${cell.problem === "error" ? "error" : "warning"}` : cell.isDim ? "text dim" : "text value";
         textElement.textContent = cell.text;
-        row.append(markElement, textElement);
+        if (cell.trace?.loop != null) {
+          const step = (symbol: string, delta: number, title: string): HTMLElement => {
+            const button: HTMLElement = document.createElement("span");
+            button.className = "step";
+            button.dataset.step = String(delta);
+            button.textContent = symbol;
+            button.title = title;
+            return button;
+          };
+          row.append(markElement, step("◀", -1, "Previous iteration (Alt+←)"), textElement, step("▶", 1, "Next iteration (Alt+→)"));
+        } else {
+          row.append(markElement, textElement);
+        }
         row.title = this.describe(cell);
         row.dataset.line = String(position.number);
       }
@@ -416,6 +583,13 @@ export class WorksheetView {
   }
 
   private onResultsClick(event: MouseEvent): void {
+    const step: HTMLElement | null = (event.target as HTMLElement).closest<HTMLElement>(".step");
+    const stepRow: HTMLElement | null | undefined = step?.closest<HTMLElement>(".result-row");
+    if (step !== null && stepRow?.dataset.line !== undefined) {
+      event.preventDefault();
+      this.stepLoopAtLine(Number(stepRow.dataset.line), Number(step.dataset.step));
+      return;
+    }
     const top: number = this.results.getBoundingClientRect().top;
     const y: number = event.clientY - top;
     const position: CellPosition | undefined = this.positions.find(

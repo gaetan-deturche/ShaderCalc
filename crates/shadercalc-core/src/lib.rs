@@ -14,6 +14,7 @@ pub mod reference;
 pub mod semantics;
 pub mod session;
 pub mod syntax;
+pub mod trace;
 pub mod types;
 pub mod units;
 pub mod values;

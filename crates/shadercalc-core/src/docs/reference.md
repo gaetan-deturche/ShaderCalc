@@ -18,6 +18,8 @@ asuint(n.x)
 
 Click a result (or put the caret on its line) to see its type, every component's bits, its units and the reference check.
 
+Inside a top-level loop, `if`, `switch` or `{ }` block, every statement shows its value too. A loop's line shows its variables and iteration (`i = 4 · 5/5`) between ◀ ▶: they, or Alt+← / Alt+→ with the caret in the loop, pick the iteration the values inside show (nested loops have one each); a statement that didn't run in that iteration shows –. With the caret on such a statement, the Inspector lists all its iterations: click one to show it everywhere. Every iteration's values are checked on DXC + WARP too. A line keeps the first 4,096 values its loops compute.
+
 The Library tab (next to Docs) lists what each library declares, with the `//` comment above each declaration: functions, structs, `typedef`s, `#define`s, globals and the variables its lines create. Click one to type it into the scratch pad (a call gets its parameters as fields: Tab moves between them), Ctrl+click to open its declaration. The filter box matches names, declarations and comments; ↑↓ and Enter work from it.
 
 ## Reference check

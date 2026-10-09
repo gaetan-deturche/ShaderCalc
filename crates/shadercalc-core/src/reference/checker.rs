@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
-use super::emitter::{HlslEmitter, component_paths, declaration, ordered_inputs};
+use super::emitter::{HarnessTrace, HlslEmitter, component_paths, declaration, ordered_inputs, store_component};
 use super::warp_device::{ComputeTimings, ENTRY_POINT, ROOT_SIGNATURE, ReferenceError, ReferenceMode, WarpDevice};
 use crate::binding::bound_tree::{BoundExpression, BoundExpressionKind, BoundStatement};
 use crate::binding::intrinsic::IntrinsicPrecision;
@@ -10,6 +10,7 @@ use crate::binding::program::{BoundInteractive, BoundProgram};
 use crate::binding::symbols::VariableKind;
 use crate::evaluation::evaluator::Storage;
 use crate::session::LineResult;
+use crate::trace::{LineTrace, trace_points};
 use crate::types::{ScalarKind, ShaderType};
 use crate::units::UnitTag;
 use crate::values::{Value, scalars};
@@ -27,6 +28,29 @@ pub enum ReferenceVerdict {
     NotChecked,
 }
 
+impl ReferenceVerdict {
+    /// How bad: the worse of two verdicts decides a line made of several values.
+    fn severity(self) -> u8 {
+        match self {
+            ReferenceVerdict::Match | ReferenceVerdict::NotChecked => 0,
+            ReferenceVerdict::WithinTolerance => 1,
+            ReferenceVerdict::WarpLimit => 2,
+            ReferenceVerdict::Mismatch => 3,
+        }
+    }
+
+    fn worse(self, other: ReferenceVerdict) -> ReferenceVerdict {
+        if other.severity() > self.severity() { other } else { self }
+    }
+}
+
+/// The reference's verdict on one trace entry (`LineTrace::entries`, same order), and its values.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TraceCheck {
+    pub verdict: ReferenceVerdict,
+    pub values: Vec<Value>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReferenceOutcome {
     pub verdict: ReferenceVerdict,
@@ -36,6 +60,8 @@ pub struct ReferenceOutcome {
     pub message: Option<String>,
     pub hlsl: String,
     pub timings: Option<ComputeTimings>,
+    /// A traced line: each entry checked.
+    pub trace: Vec<TraceCheck>,
 }
 
 impl fmt::Display for ReferenceOutcome {
@@ -44,7 +70,10 @@ impl fmt::Display for ReferenceOutcome {
             ReferenceVerdict::Match => write!(formatter, "= reference"),
             ReferenceVerdict::WithinTolerance => write!(formatter, "≈ reference ({} ulp)", self.max_ulps),
             ReferenceVerdict::Mismatch => {
-                let reference: String = self.reference_value.as_ref().map(Value::to_string).unwrap_or_default();
+                let reference: String = match &self.reference_value {
+                    Some(value) => value.to_string(),
+                    None => self.message.clone().unwrap_or_default(),
+                };
                 let approximations: String = if self.uses_approximations {
                     format!(" ({} ulp, approximate functions involved)", self.max_ulps)
                 } else {
@@ -77,6 +106,7 @@ pub fn not_checked(message: impl Into<String>, hlsl: String) -> ReferenceOutcome
         message: Some(message.into()),
         hlsl,
         timings: None,
+        trace: Vec::new(),
     }
 }
 
@@ -84,24 +114,29 @@ pub fn not_checked(message: impl Into<String>, hlsl: String) -> ReferenceOutcome
 /// literals, uniforms and session variables are fed through the input buffer, already converted to their concrete
 /// types, so WARP executes the math instead of DXC folding it, while DXC's literal rules stay intact.
 pub fn check(line: &LineResult, mode: ReferenceMode) -> ReferenceOutcome {
-    // Unit errors don't stop the numeric check; only a missing value does
-    let (Some(value), Some(bound), Some(program)) = (&line.value, &line.line, &line.program) else {
+    // Unit errors don't stop the numeric check; only a missing value (and nothing traced) does
+    let value: Option<&Value> = line.value.as_ref().filter(|value| !value.ty.is_void());
+    let trace: Option<&LineTrace> = line.trace.as_ref().filter(|trace| !trace.entries.is_empty());
+    let (Some(bound), Some(program), true) = (&line.line, &line.program, value.is_some() || trace.is_some()) else {
         return not_checked(
             if line.has_errors() { "the line has errors" } else { "the line has no value" },
             String::new(),
         );
     };
-    if value.ty.is_void() {
-        return not_checked("the line has no value", String::new());
-    }
+    // Output: the value, then for a trace how many words of it the shader wrote, then the trace
+    let result_words: usize = value.map_or(0, |value| value.to_words().len());
+    let trace_words: usize = trace.map_or(0, |trace| {
+        trace.entries.iter().flat_map(|entry| &entry.values).map(|value| value.to_words().len()).sum()
+    });
     // Problems elsewhere (another line, an unused function) don't matter: if the code this line needs is broken,
     // emitting or compiling it fails below
-    let (hlsl, inputs) = match build_harness(program, bound, &value.ty, &line.inputs) {
+    let harness = build_harness(program, bound, value.map(|value| &value.ty), &line.inputs, trace, trace_words);
+    let (hlsl, inputs) = match harness {
         Ok(built) => built,
         Err(message) => return not_checked(message, String::new()),
     };
 
-    let output_words: usize = value.to_words().len();
+    let output_words: usize = if trace.is_some() { result_words + 1 + trace_words } else { result_words };
     let device: Arc<WarpDevice> = match WarpDevice::shared() {
         Ok(device) => device,
         Err(error) => return not_checked(error.to_string(), hlsl),
@@ -113,40 +148,73 @@ pub fn check(line: &LineResult, mode: ReferenceMode) -> ReferenceOutcome {
         }
     };
 
-    let reference: Value = from_words(&value.ty, &words);
     let uses_approximations: bool = uses_approximations(bound);
-    let ours: Vec<u32> = value.to_words();
-    if ours == words || both_nan(value, &reference) {
-        return ReferenceOutcome {
-            verdict: ReferenceVerdict::Match,
-            reference_value: Some(reference),
-            max_ulps: 0,
-            uses_approximations,
-            message: None,
-            hlsl,
-            timings: Some(timings),
-        };
+    let limits: &[String] = &line.reference_limits;
+    let mut verdict: ReferenceVerdict = ReferenceVerdict::Match;
+    let mut max_ulps: i64 = 0;
+    let mut reference_value: Option<Value> = None;
+    if let Some(value) = value {
+        let reference: Value = from_words(&value.ty, &words[..result_words]);
+        (verdict, max_ulps) = compare(value, &reference, uses_approximations, limits);
+        reference_value = Some(reference);
     }
-    let max_ulps: i64 = max_ulps(value, &reference);
-    let is_close: bool = max_ulps <= APPROXIMATE_TOLERANCE_ULPS
-        || max_absolute_difference(value, &reference) <= APPROXIMATE_TOLERANCE_ABSOLUTE;
-    let verdict: ReferenceVerdict = if uses_approximations && is_close {
-        ReferenceVerdict::WithinTolerance
-    } else if !line.reference_limits.is_empty() {
-        ReferenceVerdict::WarpLimit
-    } else {
-        ReferenceVerdict::Mismatch
-    };
-    let message: Option<String> = (verdict == ReferenceVerdict::WarpLimit).then(|| line.reference_limits.join("; "));
+    let mut checks: Vec<TraceCheck> = Vec::new();
+    let mut message: Option<String> = None;
+    if let Some(trace) = trace {
+        let mut word: usize = result_words + 1;
+        for entry in &trace.entries {
+            let mut check: TraceCheck = TraceCheck { verdict: ReferenceVerdict::Match, values: Vec::new() };
+            for ours in &entry.values {
+                let count: usize = ours.to_words().len();
+                let theirs: Value = from_words(&ours.ty, &words[word..word + count]);
+                word += count;
+                let (value_verdict, ulps) = compare(ours, &theirs, uses_approximations, limits);
+                check.verdict = check.verdict.worse(value_verdict);
+                max_ulps = max_ulps.max(ulps);
+                check.values.push(theirs);
+            }
+            verdict = verdict.worse(check.verdict);
+            checks.push(check);
+        }
+        let written: usize = words[result_words] as usize;
+        if written != trace_words && !trace.is_truncated {
+            verdict = ReferenceVerdict::Mismatch;
+            message = Some(format!(
+                "WARP's loops ran differently: {written} words of values inside them, the interpreter's {trace_words}"
+            ));
+        }
+    }
+    if verdict == ReferenceVerdict::WarpLimit && message.is_none() {
+        message = Some(limits.join("; "));
+    }
     ReferenceOutcome {
         verdict,
-        reference_value: Some(reference),
+        reference_value,
         max_ulps,
         uses_approximations,
         message,
         hlsl,
         timings: Some(timings),
+        trace: checks,
     }
+}
+
+/// One value against the reference's: its verdict and distance.
+fn compare(ours: &Value, reference: &Value, uses_approximations: bool, limits: &[String]) -> (ReferenceVerdict, i64) {
+    if ours.to_words() == reference.to_words() || both_nan(ours, reference) {
+        return (ReferenceVerdict::Match, 0);
+    }
+    let max_ulps: i64 = max_ulps(ours, reference);
+    let is_close: bool = max_ulps <= APPROXIMATE_TOLERANCE_ULPS
+        || max_absolute_difference(ours, reference) <= APPROXIMATE_TOLERANCE_ABSOLUTE;
+    let verdict: ReferenceVerdict = if uses_approximations && is_close {
+        ReferenceVerdict::WithinTolerance
+    } else if !limits.is_empty() {
+        ReferenceVerdict::WarpLimit
+    } else {
+        ReferenceVerdict::Mismatch
+    };
+    (verdict, max_ulps)
 }
 
 /// Whether the line reaches a function GPUs approximate (directly or through the functions it calls).
@@ -178,14 +246,31 @@ fn expression_reaches_approximation(expression: &BoundExpression, visited: &mut 
     expression.children().into_iter().any(|child| expression_reaches_approximation(child, visited))
 }
 
-/// Builds the compute shader for one line; returns it with the input words it reads.
+/// Builds the compute shader for one line; returns it with the input words it reads. A traced line also writes
+/// every trace entry (`trace_words` of them) after the result and the count of words it wrote.
 fn build_harness(
     program: &BoundProgram,
     line: &BoundInteractive,
-    result_type: &ShaderType,
+    result_type: Option<&ShaderType>,
     inputs: &Storage,
+    trace: Option<&LineTrace>,
+    trace_words: usize,
 ) -> Result<(String, Vec<u32>), String> {
     let mut emitter: HlslEmitter = HlslEmitter::with_harness();
+    let result_words: usize =
+        result_type.map_or(0, |ty| ty.component_kinds().iter().map(|kind| kind_words(*kind)).sum());
+    if let Some(trace) = trace {
+        // The interpreter traced its own copy of the statement, numbered the same way
+        let [statement] = line.statements.as_slice() else {
+            return Err("a traced line has one statement".to_string());
+        };
+        let (points, ids) = trace_points(statement);
+        if points.len() != trace.points.len() {
+            return Err("the trace doesn't match the line's code".to_string());
+        }
+        let harness_trace: HarnessTrace = HarnessTrace { ids, points, base: result_words + 1, capacity: trace_words };
+        emitter.harness.as_mut().expect("a harness").trace = Some(harness_trace);
+    }
     emitter.text.push_str(
         "RWStructuredBuffer<uint> RefOutput : register(u0);\nStructuredBuffer<uint> RefInput : register(t0);\n\n",
     );
@@ -206,7 +291,12 @@ fn build_harness(
     }
 
     emitter.harness.as_mut().expect("a harness").is_emitting_line = true;
-    emitter.text.push_str(&format!("    {};\n", declaration(result_type, "result")));
+    if let Some(result_type) = result_type {
+        emitter.text.push_str(&format!("    {};\n", declaration(result_type, "result")));
+    }
+    if trace.is_some() {
+        emitter.text.push_str("    uint refTraceCursor = 0;\n");
+    }
     // A scope of its own: the line may redeclare a session variable (int a[4] after int a[3])
     emitter.text.push_str("    {\n");
     let result: Option<&BoundExpression> = line.result();
@@ -214,48 +304,30 @@ fn build_harness(
     for statement in &line.statements[..body_count] {
         emitter.emit_statement(statement, 2);
     }
-    let result_expression: String = match result {
-        Some(result) => emitter.expression(result),
-        None => line.result_variable.as_ref().map(|variable| variable.name.clone()).ok_or("the line has no value")?,
-    };
-    emitter.text.push_str(&format!("        result = {result_expression};\n    }}\n"));
-
-    let mut word: usize = 0;
-    for (component, path) in component_paths(result_type, "result").into_iter().enumerate() {
-        let store: String = match result_type.kind_at(component) {
-            ScalarKind::Bool => {
-                word += 1;
-                format!("    RefOutput[{}] = {} ? 1u : 0u;\n", word - 1, path)
-            }
-            ScalarKind::UInt => {
-                word += 1;
-                format!("    RefOutput[{}] = {};\n", word - 1, path)
-            }
-            ScalarKind::Double => {
-                word += 2;
-                format!(
-                    "    {{ uint low, high; asuint({}, low, high); RefOutput[{}] = low; RefOutput[{}] = high; }}\n",
-                    path,
-                    word - 2,
-                    word - 1
-                )
-            }
-            ScalarKind::Int64 | ScalarKind::UInt64 => {
-                word += 2;
-                format!(
-                    "    RefOutput[{}] = (uint)({}); RefOutput[{}] = (uint)((uint64_t)({}) >> 32);\n",
-                    word - 2,
-                    path,
-                    word - 1,
-                    path
-                )
-            }
-            _ => {
-                word += 1;
-                format!("    RefOutput[{}] = asuint({});\n", word - 1, path)
+    if result_type.is_some() {
+        let result_expression: String = match result {
+            Some(result) => emitter.expression(result),
+            None => {
+                line.result_variable.as_ref().map(|variable| variable.name.clone()).ok_or("the line has no value")?
             }
         };
-        emitter.text.push_str(&store);
+        emitter.text.push_str(&format!("        result = {result_expression};\n"));
+    } else if let Some(result) = result {
+        let text: String = emitter.expression(result);
+        emitter.text.push_str(&format!("        {text};\n"));
+    }
+    emitter.text.push_str("    }\n");
+
+    if let Some(result_type) = result_type {
+        let mut word: usize = 0;
+        for (component, path) in component_paths(result_type, "result").into_iter().enumerate() {
+            let (store, count) = store_component(result_type.kind_at(component), &path, &word.to_string());
+            emitter.text.push_str(&format!("    {store}\n"));
+            word += count;
+        }
+    }
+    if trace.is_some() {
+        emitter.text.push_str(&format!("    RefOutput[{result_words}] = refTraceCursor;\n"));
     }
     emitter.text.push_str("}\n");
     if let Some(failure) = emitter.failure {
@@ -263,6 +335,10 @@ fn build_harness(
     }
     let inputs: Vec<u32> = emitter.harness.map(|harness| harness.inputs).unwrap_or_default();
     Ok((emitter.text, inputs))
+}
+
+fn kind_words(kind: ScalarKind) -> usize {
+    if kind.is_64bit() { 2 } else { 1 }
 }
 
 /// Rebuilds a value from the shader's output words (64-bit kinds: low word first).

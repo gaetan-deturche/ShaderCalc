@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::binding::bound_tree::*;
 use crate::binding::program::BoundProgram;
 use crate::binding::symbols::{FunctionRef, VariableKind, VariableRef};
@@ -5,6 +7,7 @@ use crate::binding::type_rules;
 use crate::evaluation::evaluator::try_evaluate_constant;
 use crate::semantics::SemanticsProfile;
 use crate::syntax::tree::ParameterMode;
+use crate::trace::{TracePoint, TracePointKind};
 use crate::types::{ScalarKind, ShaderType};
 use crate::values::{Value, format_double, format_float, scalars};
 
@@ -14,6 +17,35 @@ pub struct Harness {
     pub is_emitting_line: bool,
     /// The words the shader reads from its input buffer.
     pub inputs: Vec<u32>,
+    pub trace: Option<HarnessTrace>,
+}
+
+/// A traced line: its trace points by statement node, and where the shader writes their values (in execution
+/// order from output word `base`, `capacity` words at most: what the interpreter recorded; `refTraceCursor` counts).
+pub struct HarnessTrace {
+    pub ids: HashMap<*const BoundStatement, usize>,
+    pub points: Vec<TracePoint>,
+    pub base: usize,
+    pub capacity: usize,
+}
+
+/// HLSL storing one component in the output buffer at `index` (an HLSL expression), and the words it takes.
+pub fn store_component(kind: ScalarKind, path: &str, index: &str) -> (String, usize) {
+    match kind {
+        ScalarKind::Bool => (format!("RefOutput[{index}] = {path} ? 1u : 0u;"), 1),
+        ScalarKind::UInt => (format!("RefOutput[{index}] = {path};"), 1),
+        ScalarKind::Double => (
+            format!(
+                "{{ uint low, high; asuint({path}, low, high); RefOutput[{index}] = low; RefOutput[{index} + 1] = high; }}"
+            ),
+            2,
+        ),
+        ScalarKind::Int64 | ScalarKind::UInt64 => (
+            format!("RefOutput[{index}] = (uint)({path}); RefOutput[{index} + 1] = (uint)((uint64_t)({path}) >> 32);"),
+            2,
+        ),
+        _ => (format!("RefOutput[{index}] = asuint({path});"), 1),
+    }
 }
 
 /// Writes the bound tree back as plain HLSL that DXC accepts: C++ forms come out normalised (references become
@@ -89,7 +121,7 @@ impl HlslEmitter {
     pub fn with_harness() -> HlslEmitter {
         HlslEmitter {
             text: String::new(),
-            harness: Some(Harness { is_emitting_line: false, inputs: Vec::new() }),
+            harness: Some(Harness { is_emitting_line: false, inputs: Vec::new(), trace: None }),
             failure: None,
         }
     }
@@ -191,7 +223,7 @@ impl HlslEmitter {
             }
             BoundStatementKind::Loop { condition, body, is_do_while: true, .. } => {
                 self.text.push_str(&format!("{indent}do\n"));
-                self.emit_nested(body, depth);
+                self.emit_loop_body(statement, body, depth);
                 let condition: String = self.expression(condition.as_ref().expect("do-while has a condition"));
                 self.text.push_str(&format!("{indent}while ({condition});\n"));
             }
@@ -204,7 +236,7 @@ impl HlslEmitter {
                     condition.as_ref().map(|condition| self.expression(condition)).unwrap_or_default();
                 let step: String = step.as_ref().map(|step| self.expression(step)).unwrap_or_default();
                 self.text.push_str(&format!("{indent}    for (; {condition}; {step})\n"));
-                self.emit_nested(body, depth + 1);
+                self.emit_loop_body(statement, body, depth + 1);
                 self.text.push_str(&format!("{indent}}}\n"));
             }
             BoundStatementKind::Switch { value, sections } => {
@@ -248,12 +280,72 @@ impl HlslEmitter {
                 }
                 text.push_str(";\n");
                 self.text.push_str(&text);
+                if self.trace_point(statement).is_some() {
+                    let store: String = self.trace_store(&[(variable.name.clone(), variable.ty.clone())], depth);
+                    self.text.push_str(&store);
+                }
             }
             BoundStatementKind::Expression(expression) => {
                 let text: String = self.expression(expression);
-                self.text.push_str(&format!("{indent}{text};\n"));
+                if self.trace_point(statement).is_some() {
+                    let store: String =
+                        self.trace_store(&[("refTraceValue".to_string(), expression.ty.clone())], depth + 1);
+                    let value: String = declaration(&expression.ty, "refTraceValue");
+                    self.text.push_str(&format!("{indent}{{\n{indent}    {value} = {text};\n{store}{indent}}}\n"));
+                } else {
+                    self.text.push_str(&format!("{indent}{text};\n"));
+                }
             }
         }
+    }
+
+    /// A loop's body; in a traced line, after writing the loop's variables (each iteration's entry).
+    fn emit_loop_body(&mut self, loop_statement: &BoundStatement, body: &BoundStatement, depth: usize) {
+        let Some(point) = self.trace_point(loop_statement) else {
+            self.emit_nested(body, depth);
+            return;
+        };
+        let indent: String = " ".repeat(depth * 4);
+        let variables: Vec<(String, ShaderType)> = match &self.trace().points[point].kind {
+            TracePointKind::Loop { variables } => {
+                variables.iter().map(|variable| (variable.name.clone(), variable.ty.clone())).collect()
+            }
+            TracePointKind::Value { .. } => Vec::new(),
+        };
+        let store: String = self.trace_store(&variables, depth + 1);
+        self.text.push_str(&format!("{indent}{{\n{store}"));
+        self.emit_statement(body, depth + 1);
+        self.text.push_str(&format!("{indent}}}\n"));
+    }
+
+    fn trace(&self) -> &HarnessTrace {
+        self.harness.as_ref().and_then(|harness| harness.trace.as_ref()).expect("a traced line")
+    }
+
+    /// The trace point of one of the line's statements, while emitting a traced line.
+    fn trace_point(&self, statement: &BoundStatement) -> Option<usize> {
+        let harness: &Harness = self.harness.as_ref().filter(|harness| harness.is_emitting_line)?;
+        harness.trace.as_ref()?.ids.get(&(statement as *const BoundStatement)).copied()
+    }
+
+    /// Writes values (variables, by name) as the next trace entry when it fits, and counts its words regardless.
+    fn trace_store(&self, values: &[(String, ShaderType)], depth: usize) -> String {
+        let trace: &HarnessTrace = self.trace();
+        let indent: String = " ".repeat(depth * 4);
+        let mut stores: String = String::new();
+        let mut words: usize = 0;
+        for (name, ty) in values {
+            for (component, path) in component_paths(ty, name).into_iter().enumerate() {
+                let index: String = format!("{}u + refTraceCursor + {words}u", trace.base);
+                let (store, count) = store_component(ty.kind_at(component), &path, &index);
+                stores.push_str(&format!("{indent}    {store}\n"));
+                words += count;
+            }
+        }
+        format!(
+            "{indent}if (refTraceCursor + {words}u <= {}u)\n{indent}{{\n{stores}{indent}}}\n{indent}refTraceCursor += {words}u;\n",
+            trace.capacity
+        )
     }
 
     fn emit_nested(&mut self, statement: &BoundStatement, depth: usize) {

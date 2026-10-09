@@ -12,6 +12,7 @@ use crate::binding::type_rules::{self, ConversionInfo};
 use crate::diagnostics::{Diagnostic, DiagnosticBag, DiagnosticSeverity, SourceSpan};
 use crate::semantics::SemanticsProfile;
 use crate::syntax::tree::ParameterMode;
+use crate::trace::{LineTrace, MAX_TRACE_ENTRIES, TraceEntry, TracePointKind, trace_points};
 use crate::types::{ScalarKind, ShaderType};
 use crate::units::{Dimension, UnitTag};
 use crate::values::{Value, scalars};
@@ -141,6 +142,15 @@ pub struct Evaluator<'a> {
     current_source: Option<String>,
     /// Calls the reference can't be trusted on (WARP's own limits), in the order met.
     reference_limits: Vec<String>,
+    /// Set by `trace_line`: what the line's loops, ifs and blocks compute.
+    tracer: Option<Tracer>,
+}
+
+/// A line's trace in progress: its points by statement node, and the iteration of each loop running.
+struct Tracer {
+    ids: HashMap<*const BoundStatement, usize>,
+    trace: LineTrace,
+    iterations: Vec<u32>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -177,7 +187,60 @@ impl<'a> Evaluator<'a> {
             last_result: None,
             current_source: None,
             reference_limits: Vec::new(),
+            tracer: None,
         }
+    }
+
+    /// Records what the next `run_line` of this statement computes inside its loops, ifs and blocks.
+    pub fn trace_line(&mut self, statement: &BoundStatement) {
+        let (points, ids) = trace_points(statement);
+        self.tracer = (!points.is_empty()).then(|| Tracer {
+            ids,
+            trace: LineTrace { points, ..LineTrace::default() },
+            iterations: Vec::new(),
+        });
+    }
+
+    pub fn take_trace(&mut self) -> Option<LineTrace> {
+        self.tracer.take().map(|tracer| tracer.trace)
+    }
+
+    /// The trace point of a statement, when the line is traced and it is one.
+    fn trace_point(&self, statement: &BoundStatement) -> Option<usize> {
+        self.tracer.as_ref()?.ids.get(&(statement as *const BoundStatement)).copied()
+    }
+
+    /// A traced loop starts an iteration: its variables as they stand.
+    fn record_iteration(&mut self, point: usize, iteration: u32) {
+        let Some(tracer) = self.tracer.as_mut() else {
+            return;
+        };
+        if let Some(current) = tracer.iterations.last_mut() {
+            *current = iteration;
+        }
+        let variables: Vec<VariableRef> = match &tracer.trace.points[point].kind {
+            TracePointKind::Loop { variables } => variables.clone(),
+            TracePointKind::Value { .. } => Vec::new(),
+        };
+        let values: Vec<Value> = variables
+            .iter()
+            .map(|variable| {
+                self.read_variable(variable, SourceSpan::NONE)
+                    .unwrap_or_else(|_| Value::zero(variable.ty.clone(), UnitTag::BARE))
+            })
+            .collect();
+        self.record(point, values);
+    }
+
+    fn record(&mut self, point: usize, values: Vec<Value>) {
+        let Some(tracer) = self.tracer.as_mut() else {
+            return;
+        };
+        if tracer.trace.entries.len() >= MAX_TRACE_ENTRIES {
+            tracer.trace.is_truncated = true;
+            return;
+        }
+        tracer.trace.entries.push(TraceEntry { point, iterations: tracer.iterations.clone(), values });
     }
 
     pub fn profile(&self) -> &SemanticsProfile {
@@ -335,6 +398,9 @@ impl<'a> Evaluator<'a> {
                     None => Value::zero(variable.ty.clone(), UnitTag::BARE),
                     Some(initializer) => self.evaluate(initializer)?,
                 };
+                if let Some(point) = self.trace_point(statement) {
+                    self.record(point, vec![value.clone()]);
+                }
                 if matches!(variable.kind, VariableKind::Session | VariableKind::Uniform | VariableKind::Static) {
                     self.storage.insert(variable.clone(), value);
                 } else {
@@ -344,6 +410,9 @@ impl<'a> Evaluator<'a> {
             }
             BoundStatementKind::Expression(expression) => {
                 let value: Value = self.evaluate(expression)?;
+                if let Some(point) = self.trace_point(statement) {
+                    self.record(point, vec![value.clone()]);
+                }
                 self.last_result = Some(value);
                 Ok(Flow::Normal)
             }
@@ -357,7 +426,22 @@ impl<'a> Evaluator<'a> {
                 }
             }
             BoundStatementKind::Loop { initializer, condition, step, body, is_do_while } => {
-                self.execute_loop(initializer.as_deref(), condition.as_ref(), step.as_ref(), body, *is_do_while)
+                let point: Option<usize> = self.trace_point(statement);
+                if let Some(tracer) = self.tracer.as_mut().filter(|_| point.is_some()) {
+                    tracer.iterations.push(0);
+                }
+                let flow: EvalResult<Flow> = self.execute_loop(
+                    initializer.as_deref(),
+                    condition.as_ref(),
+                    step.as_ref(),
+                    body,
+                    *is_do_while,
+                    point,
+                );
+                if let Some(tracer) = self.tracer.as_mut().filter(|_| point.is_some()) {
+                    tracer.iterations.pop();
+                }
+                flow
             }
             BoundStatementKind::Switch { value, sections } => self.execute_switch(value, sections),
             BoundStatementKind::Return(value) => {
@@ -371,6 +455,7 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// `point`: the loop's trace point, when traced (its iteration is the last of the tracer's).
     fn execute_loop(
         &mut self,
         initializer: Option<&BoundStatement>,
@@ -378,11 +463,13 @@ impl<'a> Evaluator<'a> {
         step: Option<&BoundExpression>,
         body: &BoundStatement,
         is_do_while: bool,
+        point: Option<usize>,
     ) -> EvalResult<Flow> {
         if let Some(initializer) = initializer {
             self.execute(initializer)?;
         }
         let mut is_first: bool = true;
+        let mut iteration: u32 = 0;
         loop {
             if !(is_do_while && is_first)
                 && let Some(condition) = condition
@@ -391,6 +478,10 @@ impl<'a> Evaluator<'a> {
                 return Ok(Flow::Normal);
             }
             is_first = false;
+            if let Some(point) = point {
+                self.record_iteration(point, iteration);
+            }
+            iteration += 1;
             let flow: Flow = self.execute(body)?;
             if flow == Flow::Break {
                 return Ok(Flow::Normal);

@@ -9,6 +9,7 @@ use crate::evaluation::evaluator::{EvaluationOptions, Evaluator, Interrupt, Stor
 use crate::semantics::SemanticsProfile;
 use crate::syntax::parser::{parse_interactive, parse_program};
 use crate::syntax::tree::{CompilationUnitSyntax, DeclarationSyntax, ItemSyntax, StatementSyntax};
+use crate::trace::LineTrace;
 use crate::types::{NumericType, ScalarKind, ShaderType};
 use crate::units::UNITS;
 use crate::values::{Value, scalars};
@@ -27,6 +28,8 @@ pub struct LineResult {
     pub inputs: Storage,
     /// Why WARP's result can't be trusted for this line (sinh, sin of huge angles...); empty when it can.
     pub reference_limits: Vec<String>,
+    /// A worksheet line's values inside its loops, ifs and blocks.
+    pub trace: Option<LineTrace>,
 }
 
 impl LineResult {
@@ -287,6 +290,7 @@ impl ShaderSession {
             program: Some(program),
             inputs,
             reference_limits,
+            trace: None,
         }
     }
 }

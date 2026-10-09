@@ -78,6 +78,36 @@ export interface Line {
   to: number;
   value: ValueInfo | null;
   diagnostics: Diagnostic[];
+  trace: Trace | null;
+}
+
+/** A statement inside a line's loops/ifs/blocks ("value"), or a loop with its variables. */
+export interface TracePoint {
+  kind: "value" | "loop";
+  firstLine: number;
+  lastLine: number;
+  /** Enclosing loops (point indices), outermost first. */
+  loops: number[];
+  variables: string[];
+}
+
+/** One execution of a point: its iteration in each enclosing loop (a loop's own entry: its iteration last). */
+export interface TraceEntry {
+  point: number;
+  iterations: number[];
+  values: ValueInfo[];
+}
+
+export interface Trace {
+  points: TracePoint[];
+  entries: TraceEntry[];
+  isTruncated: boolean;
+}
+
+/** The reference's verdict on a trace entry; its values only when they differ. */
+export interface TraceCheck {
+  verdict: Verdict;
+  values: ValueInfo[];
 }
 
 export interface Symbol {
@@ -119,6 +149,7 @@ export interface Reference {
   hlsl: string;
   referenceValue: ValueInfo | null;
   timings: { compileMs: number; pipelineMs: number; runMs: number } | null;
+  trace: TraceCheck[];
 }
 
 export interface DocEntry {
