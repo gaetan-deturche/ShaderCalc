@@ -14,7 +14,7 @@ jobs:
   release:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -27,7 +27,7 @@ jobs:
           if ((Get-Content app/src-tauri/Cargo.toml -Raw) -notmatch "(?m)^version = `"$version`"") { throw "app/src-tauri/Cargo.toml isn't at $version" }
           if (-not (Get-Content app/src-tauri/update-public-key.txt -Raw)) { throw "No update public key: run scripts/new-signing-key.ps1" }
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
