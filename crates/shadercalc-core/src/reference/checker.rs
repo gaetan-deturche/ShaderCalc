@@ -12,7 +12,7 @@ use crate::binding::program::{BoundInteractive, BoundProgram};
 use crate::binding::symbols::{FunctionRef, VariableKind};
 use crate::evaluation::evaluator::Storage;
 use crate::session::LineResult;
-use crate::trace::{CallSite, CallTrace, LineTrace, call_sites, trace_points};
+use crate::trace::{CallSite, CallTrace, LineTrace, MAX_TRACED_RUNS, call_sites, trace_points};
 use crate::types::{ScalarKind, ShaderType};
 use crate::units::UnitTag;
 use crate::values::{Value, scalars};
@@ -234,15 +234,53 @@ pub fn check_call(
     call: &CallTrace,
     mode: ReferenceMode,
 ) -> ReferenceOutcome {
+    check_calls(line, path, &call.trace, None, mode)
+}
+
+/// Like `check_call` for every run of the last call (`worksheet::trace_call_runs`, keeping `points`): one shader
+/// runs them all, the entries of each run in turn.
+pub fn check_call_runs(
+    line: &LineResult,
+    path: &[(usize, usize)],
+    runs: &[CallTrace],
+    points: &[usize],
+    mode: ReferenceMode,
+) -> ReferenceOutcome {
+    let Some(first) = runs.first() else {
+        return not_checked("the call didn't run", String::new());
+    };
+    let mut combined: LineTrace = LineTrace { points: first.trace.points.clone(), ..LineTrace::default() };
+    for run in runs {
+        combined.entries.extend(run.trace.entries.iter().cloned());
+        combined.is_truncated |= run.trace.is_truncated;
+    }
+    combined.is_truncated |= runs.len() >= MAX_TRACED_RUNS;
+    let mut kept: Vec<usize> = points.to_vec();
+    for point in points {
+        if let Some(found) = combined.points.get(*point) {
+            kept.extend(&found.loops);
+        }
+    }
+    check_calls(line, path, &combined, Some(&kept), mode)
+}
+
+/// The reference check of traced calls: `kept` (every run) or the one run `path` leads to.
+fn check_calls(
+    line: &LineResult,
+    path: &[(usize, usize)],
+    trace: &LineTrace,
+    kept: Option<&[usize]>,
+    mode: ReferenceMode,
+) -> ReferenceOutcome {
     let (Some(bound), Some(program)) = (&line.line, &line.program) else {
         return not_checked("the line has errors", String::new());
     };
-    if call.trace.entries.is_empty() {
+    if trace.entries.is_empty() {
         return not_checked("the call computed nothing to check", String::new());
     }
     let trace_words: usize =
-        call.trace.entries.iter().flat_map(|entry| &entry.values).map(|value| value.to_words().len()).sum();
-    let (hlsl, inputs) = match build_call_harness(program, bound, &line.inputs, path, &call.trace, trace_words) {
+        trace.entries.iter().flat_map(|entry| &entry.values).map(|value| value.to_words().len()).sum();
+    let (hlsl, inputs) = match build_call_harness(program, bound, &line.inputs, path, trace, trace_words, kept) {
         Ok(built) => built,
         Err(message) => return not_checked(message, String::new()),
     };
@@ -258,7 +296,7 @@ pub fn check_call(
     };
     let uses_approximations: bool = uses_approximations(bound);
     let limits: &[String] = &line.reference_limits;
-    let compared: TraceComparison = compare_trace(&call.trace, &words, trace_words, uses_approximations, limits);
+    let compared: TraceComparison = compare_trace(trace, &words, trace_words, uses_approximations, limits);
     let message: Option<String> =
         compared.message.or_else(|| (compared.verdict == ReferenceVerdict::WarpLimit).then(|| limits.join("; ")));
     ReferenceOutcome {
@@ -275,6 +313,7 @@ pub fn check_call(
 
 /// The shader for one call: the line with its code, and a copy of each function on the path (`RefTraced<level>_<name>`
 /// with a `refOn` switch: on for the chosen run only, counted in `refRun<level>`); the last copy writes its trace.
+/// With `kept`, every run of the last call is on and only those points are written.
 fn build_call_harness(
     program: &BoundProgram,
     line: &BoundInteractive,
@@ -282,6 +321,7 @@ fn build_call_harness(
     path: &[(usize, usize)],
     trace: &LineTrace,
     trace_words: usize,
+    kept: Option<&[usize]>,
 ) -> Result<(String, Vec<u32>), String> {
     let [statement] = line.statements.as_slice() else {
         return Err("the line has several statements".to_string());
@@ -299,7 +339,7 @@ fn build_call_harness(
         functions.push(target.function.clone());
         nodes.push(node);
     }
-    let (Some(last_body), Some((_, first_run))) = (bodies.last(), path.first()) else {
+    let Some(last_body) = bodies.last() else {
         return Err("no call to look inside".to_string());
     };
     let names: Vec<String> =
@@ -315,10 +355,22 @@ fn build_call_harness(
     }
     emitter.emit_program(program, true);
     // Deepest first: each copy calls the next one
-    let (points, ids) = trace_points(last_body);
+    let (points, mut ids) = trace_points(last_body);
     if points.len() != trace.points.len() {
         return Err("the trace doesn't match the function's code".to_string());
     }
+    if let Some(kept) = kept {
+        ids.retain(|_, point| kept.contains(point));
+    }
+    // The switch of the call to level `next`: its chosen run, or every run of the last one
+    let switch = |next: usize, outer: &str| -> String {
+        if kept.is_some() && next + 1 == path.len() {
+            outer.to_string()
+        } else {
+            let counted: String = format!("(refRun{next} ++ == {}u)", path[next].1);
+            if outer == "true" { counted } else { format!("{outer} && {counted}") }
+        }
+    };
     let harness_trace: HarnessTrace = HarnessTrace {
         ids,
         points,
@@ -332,8 +384,7 @@ fn build_call_harness(
         emitter.redirects.clear();
         let is_last: bool = level + 1 == path.len();
         if !is_last {
-            let switch: String = format!("refOn && (refRun{} ++ == {}u)", level + 1, path[level + 1].1);
-            emitter.redirects.insert(nodes[level + 1], (names[level + 1].clone(), switch));
+            emitter.redirects.insert(nodes[level + 1], (names[level + 1].clone(), switch(level + 1, "refOn")));
         }
         if let Some(trace) = emitter.harness.as_mut().and_then(|harness| harness.trace.as_mut()) {
             trace.is_active = is_last;
@@ -344,7 +395,7 @@ fn build_call_harness(
         trace.is_active = false;
     }
     emitter.redirects.clear();
-    emitter.redirects.insert(nodes[0], (names[0].clone(), format!("(refRun0 ++ == {first_run}u)")));
+    emitter.redirects.insert(nodes[0], (names[0].clone(), switch(0, "true")));
 
     emitter
         .text

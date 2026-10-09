@@ -83,7 +83,8 @@ component is raw `u64` bits plus a `UnitTag`).
   walks its own copy of the tree with the same numbering (the interpreter's tree is a clone).
 - Calls (`worksheet::trace_call`): re-runs a line from `LineResult::inputs` with `Evaluator::follow_call(path)`:
   per level a (site, run) pair, runs counted only at the followed frame depth; the last call's body is traced
-  (`CallTrace`: arguments, result, body trace, the function's lines).
+  (`CallTrace`: arguments, result, body trace, the function's lines). `trace_call_runs` (`follow_every_call`)
+  traces every run of the last call (up to `MAX_TRACED_RUNS`), keeping only some points and their loops.
 
 ## Reference (`reference/`)
 
@@ -106,7 +107,8 @@ component is raw `u64` bits plus a `UnitTag`).
   call leading to the next level is redirected to its copy (`HlslEmitter::redirects`) with `refOn && (refRun<n>++
   == run)`, so it's on for the chosen run only; the last copy stores its trace guarded by `refOn`
   (`HarnessTrace::guard`), cursor and run counters are static globals. Literals stay literals in the copies (DXC
-  folds them as in the real function). Output: the count, then the entries.
+  folds them as in the real function). Output: the count, then the entries. `check_call_runs`: the last call's
+  switch passes `refOn` through (every run on) and only the kept points are stored.
 - A shader that removes the WARP device (a double fma does) yields `ReferenceError::Crashed`; the dead device is
   dropped and recreated on the next run (D3D12 hands back the same device while any reference to it lives).
 - Verdicts: bit-identical `✓`; `≈` for approximate intrinsics within 64 ulp or 0.0008 absolute; `⊘` WarpLimit when
@@ -143,9 +145,15 @@ component is raw `u64` bits plus a `UnitTag`).
   `traceFocus` + `buildTraceInspector`: the line's variables stacked (bits each), then an iteration table whose
   rows stack them too (click = choose). `peek.ts`: a `Peek` is a block widget (`peekField`) under a call line (⤵ in
   the result row, F11): `traceCall` / `checkCall` with the path from the line (site, run from
-  `TraceIndex::occurrence` for the chosen iterations), the function's lines highlighted (`highlightTree` with the
-  editor's `HighlightStyle`), its values and steppers (own `IterationChoices`), nested peeks per line; a row click
-  sets `peekFocus` for the Inspector until the caret moves. Peeks follow re-evaluations and iteration changes.
+  `TraceIndex::occurrence` for the chosen iterations), the call's arguments and the function's lines highlighted
+  (`highlightTree` with the editor's `HighlightStyle`), nested peeks per line. Its values, steppers (own
+  `IterationChoices`) and ⤵ are `PeekCell`s the result column draws at each peek row's DOM position. Each drawing
+  bumps `Peek::drawing`, which makes the `PeekWidget` unequal so CodeMirror re-measures it (with a short document the
+  content height doesn't change, so a plain `requestMeasure` leaves the height map stale); spacing is the frame's
+  padding, never margins (outside CodeMirror's measurement). A row click sets `peekFocus` for the Inspector until
+  the caret moves; when the call runs several times (`SiteRuns` from the code making it), `traceCallRuns` /
+  `checkCallRuns` add every run, merged into one trace whose first loop is the runs. Peeks follow re-evaluations
+  and iteration changes.
   `marks.ts`: `markOf`, `worstVerdict`. `docs.ts`: the docs panel (`marked`). `library.ts`: the Library panel from `evaluate`'s `exports`, grouped by
   library in tab order (re-rendered only when they change). Click → `WorksheetView.insertSnippet` in the scratch
   pad (a CodeMirror snippet, parameters as numbered fields; it replaces a partly typed name, stays inline in an

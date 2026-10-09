@@ -557,8 +557,15 @@ table.components tr.dim td {
   cursor: pointer;
 }
 
+.peek-frame {
+  padding: 2px 0 6px 18px;
+}
+
+.peek .peek-frame {
+  padding-left: 26px;
+}
+
 .peek {
-  margin: 2px 0 6px 18px;
   border: 1px solid var(--border);
   border-left: 3px solid var(--accent);
   border-radius: 4px;
@@ -567,10 +574,6 @@ table.components tr.dim td {
   font-size: 13px;
   white-space: pre;
   cursor: default;
-}
-
-.peek .peek {
-  margin-left: 26px;
 }
 
 .peek-header {
@@ -650,24 +653,10 @@ table.components tr.dim td {
   color: var(--editor-fg);
 }
 
-.peek-row .mark {
-  flex: none;
-  width: 14px;
-}
-
-.peek-result {
-  flex: 0 1 45%;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  text-align: left;
-}
-
-.peek-result .step,
-.peek-result .peek-toggle {
-  padding: 0 4px;
-  color: var(--accent);
-  cursor: pointer;
+/* A peek's lines in the result column, banded like the peek */
+.result-row.peek-cell {
+  background: var(--surface);
+  border-left: 3px solid var(--accent);
 }
 
 .peek-message {

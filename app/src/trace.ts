@@ -18,6 +18,12 @@ export interface TraceFocus {
   choose(entry: number): void;
 }
 
+/** A run of a call site: the iterations of the loops around it, and their variables ("i = 2"). */
+export interface SiteRun {
+  iterations: number[];
+  label: string;
+}
+
 /** One value an entry holds: the variable it belongs to (none for a plain value). */
 export interface ValuePart {
   name: string | null;
@@ -185,7 +191,7 @@ export class TraceIndex {
     loops.forEach((loop: number, depth: number) => {
       const entry: number | null = this.entryAtPath(loop, path.slice(0, depth + 1));
       if (entry !== null) {
-        parts.push(...this.parts(entry).map((part: ValuePart) => `${part.name} = ${part.value.text}`));
+        parts.push(...this.parts(entry).map((part: ValuePart) => (part.name === null ? part.value.text : `${part.name} = ${part.value.text}`)));
       }
     });
     return parts.join(", ");
@@ -221,6 +227,37 @@ export class TraceIndex {
       }
     });
     return found;
+  }
+
+  /** Sets the iterations of some loops (outermost first). */
+  setPath(loops: number[], path: number[], choices: IterationChoices): void {
+    loops.forEach((loop: number, depth: number) => {
+      if (path[depth] !== undefined) {
+        choices.set(this.key(loop), path[depth]);
+      }
+    });
+  }
+
+  /** The loops around a call site, outermost first. */
+  private siteLoops(site: number): number[] {
+    const loop: number | null = this.loopAt(this.trace.calls[site].firstLine);
+    return loop === null ? [] : this.loopsOf(loop);
+  }
+
+  /** Each run of a call site, in order: the iterations of the loops around it, and their variables. */
+  siteRuns(site: number): SiteRun[] {
+    const loops: number[] = this.siteLoops(site);
+    return this.trace.callEntries
+      .filter((entry: CallEntry) => entry.site === site)
+      .map((entry: CallEntry, run: number) => ({ iterations: entry.iterations, label: this.loopVariables(loops, entry.iterations) || `call ${run + 1}` }));
+  }
+
+  /** Chooses the iterations a run of a call site happened in. */
+  chooseRun(site: number, run: number, choices: IterationChoices): void {
+    const target: SiteRun | undefined = this.siteRuns(site)[run];
+    if (target !== undefined) {
+      this.setPath(this.siteLoops(site), target.iterations, choices);
+    }
   }
 
   /** Which run of a call site the chosen iterations select (its first in them); null when it didn't run there. */

@@ -138,6 +138,13 @@ impl Backend {
                 let path: Vec<(usize, usize)> = argument(arguments, "path")?;
                 self.trace_call(generation, index, &path)
             }
+            "traceCallRuns" | "checkCallRuns" => {
+                let generation: u64 = argument(arguments, "generation")?;
+                let index: usize = argument(arguments, "index")?;
+                let path: Vec<(usize, usize)> = argument(arguments, "path")?;
+                let points: Vec<usize> = argument(arguments, "points")?;
+                self.call_runs(generation, index, &path, &points, command == "checkCallRuns")
+            }
             "checkCall" => {
                 let generation: u64 = argument(arguments, "generation")?;
                 let index: usize = argument(arguments, "index")?;
@@ -250,6 +257,40 @@ impl Backend {
         let line: &WorksheetLine = result.lines.get(index).ok_or_else(|| format!("no line {index}"))?;
         let call: CallTrace = worksheet::trace_call(line, &documents, path, profile, &EvaluationOptions::default())?;
         serde_json::to_value(CallTraceDto::from(&call)).map_err(|error| error.to_string())
+    }
+
+    /// Every run of the call `path` leads to (its last run doesn't matter), keeping `points`: the runs, or with
+    /// `is_check` their reference check; null when a newer evaluation replaced it.
+    fn call_runs(
+        &self,
+        generation: u64,
+        index: usize,
+        path: &[(usize, usize)],
+        points: &[usize],
+        is_check: bool,
+    ) -> Result<Json, String> {
+        let (result, documents, profile) = match &*self.last.lock().expect("evaluation lock") {
+            Some((last, result, documents, profile)) if *last == generation => {
+                (result.clone(), documents.clone(), *profile)
+            }
+            _ => return Ok(Json::Null),
+        };
+        let line: &WorksheetLine = result.lines.get(index).ok_or_else(|| format!("no line {index}"))?;
+        let options: EvaluationOptions = EvaluationOptions::default();
+        let runs: Vec<CallTrace> = worksheet::trace_call_runs(line, &documents, path, points, profile, &options)?;
+        if !is_check {
+            let runs: Vec<CallTraceDto> = runs.iter().map(CallTraceDto::from).collect();
+            return serde_json::to_value(runs).map_err(|error| error.to_string());
+        }
+        let outcome = if profile.has_reference() {
+            checker::check_call_runs(&line.result, path, &runs, points, ReferenceMode::Strict)
+        } else {
+            checker::not_checked(
+                format!("DXC + WARP check the HLSL profile only, not {}", profile.label),
+                String::new(),
+            )
+        };
+        serde_json::to_value(ReferenceDto::from(&outcome)).map_err(|error| error.to_string())
     }
 
     /// The reference check of one call made by a line of an evaluation; null when a newer evaluation replaced it.

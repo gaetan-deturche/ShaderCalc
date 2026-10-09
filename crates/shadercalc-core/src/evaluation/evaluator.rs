@@ -13,7 +13,8 @@ use crate::diagnostics::{Diagnostic, DiagnosticBag, DiagnosticSeverity, SourceSp
 use crate::semantics::SemanticsProfile;
 use crate::syntax::tree::ParameterMode;
 use crate::trace::{
-    CallEntry, CallTrace, LineTrace, MAX_TRACE_ENTRIES, TraceEntry, TracePointKind, call_sites, trace_points,
+    CallEntry, CallTrace, LineTrace, MAX_TRACE_ENTRIES, MAX_TRACED_RUNS, TraceEntry, TracePointKind, call_sites,
+    trace_points,
 };
 use crate::types::{ScalarKind, ShaderType};
 use crate::units::{Dimension, UnitTag};
@@ -181,6 +182,11 @@ struct Follower {
     arguments: Vec<Value>,
     is_finished: bool,
     result: Option<CallTrace>,
+    /// Every run of the last call is traced (`results`), not one.
+    is_every_run: bool,
+    /// Frame depth of the code making the last call.
+    parent_depth: usize,
+    results: Vec<CallTrace>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -236,6 +242,16 @@ impl<'a> Evaluator<'a> {
     /// The next run of this line statement traces the call `path` leads to: the `occurrence`-th run of call `site`
     /// (numbered like `call_sites`) in the line, then in that function's body, and so on.
     pub fn follow_call(&mut self, statement: &BoundStatement, path: Vec<(usize, usize)>) {
+        self.follow(statement, path, false);
+    }
+
+    /// Like `follow_call`, but every run of the last call (whatever its occurrence in `path`) is traced, up to
+    /// `MAX_TRACED_RUNS`.
+    pub fn follow_every_call(&mut self, statement: &BoundStatement, path: Vec<(usize, usize)>) {
+        self.follow(statement, path, true);
+    }
+
+    fn follow(&mut self, statement: &BoundStatement, path: Vec<(usize, usize)>, is_every_run: bool) {
         let (_, sites) = call_sites(statement);
         self.follower = Some(Follower {
             path,
@@ -246,11 +262,18 @@ impl<'a> Evaluator<'a> {
             arguments: Vec::new(),
             is_finished: false,
             result: None,
+            is_every_run,
+            parent_depth: 1,
+            results: Vec::new(),
         });
     }
 
     pub fn take_call_trace(&mut self) -> Option<CallTrace> {
         self.follower.take().and_then(|follower| follower.result)
+    }
+
+    pub fn take_call_runs(&mut self) -> Vec<CallTrace> {
+        self.follower.take().map(|follower| follower.results).unwrap_or_default()
     }
 
     /// The trace point of a statement, when its code is traced and it is one.
@@ -287,7 +310,11 @@ impl<'a> Evaluator<'a> {
         let runs: &mut usize = follower.runs.entry(site).or_insert(0);
         let occurrence: usize = *runs;
         *runs += 1;
-        follower.path.get(follower.level) == Some(&(site, occurrence))
+        let is_last: bool = follower.level + 1 == follower.path.len();
+        match follower.path.get(follower.level) {
+            Some(&(target, run)) => site == target && (run == occurrence || (follower.is_every_run && is_last)),
+            None => false,
+        }
     }
 
     /// Inside a followed call (its frame pushed): the next level's sites, or the body to trace.
@@ -297,6 +324,9 @@ impl<'a> Evaluator<'a> {
             function.parameters.iter().filter_map(|parameter| self.frame().locals.get(parameter).cloned()).collect();
         let follower: &mut Follower = self.follower.as_mut().expect("a follower");
         follower.level += 1;
+        if follower.level == follower.path.len() {
+            follower.parent_depth = follower.depth;
+        }
         follower.depth = depth;
         if follower.level == follower.path.len() {
             follower.arguments = arguments;
@@ -314,13 +344,22 @@ impl<'a> Evaluator<'a> {
         if follower.is_finished {
             return;
         }
-        follower.is_finished = true;
         if let Some(trace) = trace.filter(|_| follower.level == follower.path.len()) {
             let result: Option<Value> = outcome.as_ref().ok().filter(|value| !value.ty.is_void()).cloned();
             let arguments: Vec<Value> = std::mem::take(&mut follower.arguments);
-            follower.result =
-                Some(CallTrace { function: function.clone(), arguments, result, trace, first_line: 0, last_line: 0 });
+            let call: CallTrace =
+                CallTrace { function: function.clone(), arguments, result, trace, first_line: 0, last_line: 0 };
+            if follower.is_every_run {
+                // Back in the code making the call: its next runs are traced too
+                follower.results.push(call);
+                follower.level -= 1;
+                follower.depth = follower.parent_depth;
+                follower.is_finished = follower.results.len() >= MAX_TRACED_RUNS;
+                return;
+            }
+            follower.result = Some(call);
         }
+        follower.is_finished = true;
     }
 
     /// A traced loop starts an iteration: its variables as they stand.

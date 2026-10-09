@@ -12,6 +12,9 @@ use crate::values::Value;
 /// Entries kept per line (each goes to the UI on every evaluation): a longer run keeps its first ones.
 pub const MAX_TRACE_ENTRIES: usize = 4_096;
 
+/// Runs of a call traced at once (`Evaluator::follow_every_call`).
+pub const MAX_TRACED_RUNS: usize = 1_024;
+
 #[derive(Clone, Debug)]
 pub enum TracePointKind {
     /// A statement that writes variables (declares, assigns, increments, passes as out/inout): their values after it.

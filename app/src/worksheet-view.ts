@@ -19,7 +19,7 @@ import {
 import { StreamLanguage } from "@codemirror/language";
 import { hlslHighlight, hlslLanguage } from "./hlsl";
 import { markOf, worstVerdict } from "./marks";
-import { CallPath, Peek, PeekHooks, PeekSite } from "./peek";
+import { CallPath, Peek, PeekCell, PeekHooks, PeekSite } from "./peek";
 import { IterationChoices, TraceFocus, TraceIndex } from "./trace";
 import { CallTrace, Diagnostic, Line, Reference, Severity, TracePoint, Verdict } from "./types";
 
@@ -60,16 +60,23 @@ const peekField = StateField.define<DecorationSet>({
   provide: (field) => EditorView.decorations.from(field),
 });
 
+/** A peek's element; a new drawing makes it unequal, so the editor measures its height again. */
 class PeekWidget extends WidgetType {
   readonly peek: Peek;
+  readonly drawing: number;
 
   constructor(peek: Peek) {
     super();
     this.peek = peek;
+    this.drawing = peek.drawing;
   }
 
   eq(other: PeekWidget): boolean {
-    return other.peek === this.peek;
+    return other.peek === this.peek && other.drawing === this.drawing;
+  }
+
+  updateDOM(dom: HTMLElement): boolean {
+    return dom === this.peek.element;
   }
 
   toDOM(): HTMLElement {
@@ -85,6 +92,8 @@ interface CellPosition {
   number: number;
   top: number;
   height: number;
+  /** A line of a peek (its cell, by index in `peekCells`). */
+  peekCell?: number;
 }
 
 export interface WorksheetHooks {
@@ -94,6 +103,8 @@ export interface WorksheetHooks {
   /** Looks inside a call a line makes (see `Peek`). */
   traceCall(line: Line, path: CallPath): Promise<CallTrace | null>;
   checkCall(line: Line, path: CallPath): Promise<Reference | null>;
+  traceCallRuns(line: Line, path: CallPath, points: number[]): Promise<CallTrace[] | null>;
+  checkCallRuns(line: Line, path: CallPath, points: number[]): Promise<Reference | null>;
   documentText(name: string): string | null;
   intrinsics: string[];
   resultWidth: number;
@@ -138,6 +149,9 @@ export class WorksheetView {
   private peeks: Peek[] = [];
   /** A peek row picked for the Inspector (until the caret moves). */
   private peekFocus: TraceFocus | null = null;
+  /** The peeks' cells the result column shows. */
+  private peekCells: PeekCell[] = [];
+  private isPeekSyncPending: boolean = false;
   private language: StreamLanguage<unknown> | null = null;
   private lines: Line[] = [];
   private references: Map<number, Reference> = new Map();
@@ -555,16 +569,21 @@ export class WorksheetView {
         const owner: Line | null = line();
         return owner === null ? Promise.resolve(null) : this.hooks.checkCall(owner, path);
       },
+      traceCallRuns: (path: CallPath, points: number[]) => {
+        const owner: Line | null = line();
+        return owner === null ? Promise.resolve(null) : this.hooks.traceCallRuns(owner, path, points);
+      },
+      checkCallRuns: (path: CallPath, points: number[]) => {
+        const owner: Line | null = line();
+        return owner === null ? Promise.resolve(null) : this.hooks.checkCallRuns(owner, path, points);
+      },
       documentText: (name: string) => (name === this.name ? this.text : this.hooks.documentText(name)),
       language: this.language!,
       focus: (focus: TraceFocus) => {
         this.peekFocus = focus;
         this.hooks.onSelect(this);
       },
-      resized: () => {
-        this.view.requestMeasure();
-        this.scheduleLayout();
-      },
+      changed: () => this.peekChanged(),
     };
     peek = new Peek(
       hooks,
@@ -572,6 +591,16 @@ export class WorksheetView {
       lineNumber,
       sites,
       (site: number) => (peek === null ? null : (this.traceWithCallsOn(peek.lineNumber)?.occurrence(site, this.choices) ?? null)),
+      (site: number) => {
+        const index: TraceIndex | null = peek === null ? null : this.traceWithCallsOn(peek.lineNumber);
+        return {
+          runs: index?.siteRuns(site) ?? [],
+          choose: (run: number) => {
+            index?.chooseRun(site, run, this.choices);
+            this.refreshTrace();
+          },
+        };
+      },
       () => this.closePeek(peek!),
     );
     this.peeks.push(peek);
@@ -590,6 +619,19 @@ export class WorksheetView {
     }
     this.syncPeeks();
     this.scheduleLayout();
+  }
+
+  /** A peek was drawn again: its widget is replaced (outside any editor update), so its height is measured. */
+  private peekChanged(): void {
+    if (this.isPeekSyncPending) {
+      return;
+    }
+    this.isPeekSyncPending = true;
+    queueMicrotask(() => {
+      this.isPeekSyncPending = false;
+      this.syncPeeks();
+      this.scheduleLayout();
+    });
   }
 
   /** The peeks as block widgets under their lines. */
@@ -705,6 +747,15 @@ export class WorksheetView {
           const block = view.lineBlockAt(view.state.doc.line(number).from);
           positions.push({ number, top: documentTop + block.top, height: Math.min(block.height, lineHeight) });
         }
+        // The peeks' lines, where their rows are drawn
+        const resultsTop: number = this.results.getBoundingClientRect().top;
+        this.peekCells = this.peeks.flatMap((peek: Peek) => (peek.element.isConnected ? peek.cells() : []));
+        this.peekCells.forEach((cell: PeekCell, index: number) => {
+          const box: DOMRect = cell.row.getBoundingClientRect();
+          if (box.height > 0) {
+            positions.push({ number: cell.line, top: box.top - resultsTop, height: box.height, peekCell: index });
+          }
+        });
         return positions;
       },
       write: (positions: CellPosition[]) => {
@@ -723,6 +774,11 @@ export class WorksheetView {
       row.style.top = `${position.top}px`;
       row.style.height = `${position.height}px`;
       row.style.lineHeight = `${position.height}px`;
+      if (position.peekCell !== undefined) {
+        this.renderPeekCell(row, position.peekCell);
+        fragment.append(row);
+        continue;
+      }
       if (position.number === this.selectedNumber) {
         row.classList.add("selected");
       }
@@ -764,6 +820,37 @@ export class WorksheetView {
     this.results.replaceChildren(fragment);
   }
 
+  /** A peek line's values in the result column: mark, its loop's stepper, values, its calls' ⤵. */
+  private renderPeekCell(row: HTMLElement, index: number): void {
+    const cell: PeekCell = this.peekCells[index];
+    row.classList.add("peek-cell");
+    row.dataset.peekCell = String(index);
+    row.title = cell.title;
+    const { mark, kind } = markOf(null, cell.verdict === undefined ? undefined : { verdict: cell.verdict }, cell.hasValue);
+    const markElement: HTMLElement = document.createElement("span");
+    markElement.className = `mark ${kind}`;
+    markElement.textContent = mark;
+    const text: HTMLElement = document.createElement("span");
+    text.className = cell.isDim ? "text dim" : "text value";
+    text.textContent = cell.text;
+    const button = (className: string, symbol: string, title: string, step: number = 0): HTMLElement => {
+      const element: HTMLElement = document.createElement("span");
+      element.className = className;
+      element.textContent = symbol;
+      element.title = title;
+      element.dataset.step = String(step);
+      return element;
+    };
+    if (cell.loop !== null) {
+      row.append(markElement, button("step", "◀", "Previous iteration", -1), text, button("step", "▶", "Next iteration", 1));
+    } else {
+      row.append(markElement, text);
+    }
+    if (cell.hasCalls) {
+      row.append(button("peek-toggle", cell.isOpen ? "⤴" : "⤵", cell.isOpen ? "Close the look inside" : "Look inside the call"));
+    }
+  }
+
   private describe(cell: Cell): string {
     const parts: string[] = [cell.text];
     if (cell.details !== null) {
@@ -777,6 +864,24 @@ export class WorksheetView {
   }
 
   private onResultsClick(event: MouseEvent): void {
+    // A peek line's row: its stepper, its ⤵, else its Inspector page
+    const peekRow: HTMLElement | null = (event.target as HTMLElement).closest<HTMLElement>(".result-row.peek-cell");
+    if (peekRow !== null) {
+      event.preventDefault();
+      const cell: PeekCell | undefined = this.peekCells[Number(peekRow.dataset.peekCell)];
+      const control: HTMLElement | null = (event.target as HTMLElement).closest<HTMLElement>(".step, .peek-toggle");
+      if (cell === undefined) {
+        return;
+      }
+      if (control?.classList.contains("step") && cell.loop !== null) {
+        cell.peek.step(cell.loop, Number(control.dataset.step));
+      } else if (control?.classList.contains("peek-toggle")) {
+        cell.peek.toggle(cell.line);
+      } else if (cell.hasValue) {
+        cell.peek.showInInspector(cell.line);
+      }
+      return;
+    }
     const step: HTMLElement | null = (event.target as HTMLElement).closest<HTMLElement>(".step");
     const stepRow: HTMLElement | null | undefined = step?.closest<HTMLElement>(".result-row");
     if (step !== null && stepRow?.dataset.line !== undefined) {

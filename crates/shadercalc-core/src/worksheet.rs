@@ -14,7 +14,7 @@ use crate::syntax::lexer::{Token, tokenize};
 use crate::syntax::parser::parse_worksheet;
 use crate::syntax::preprocessor::{MacroDefinition, Preprocessor};
 use crate::syntax::tree::{DeclarationSyntax, ExpressionKind, ItemSyntax, StatementKind};
-use crate::trace::{CallTrace, LineTrace};
+use crate::trace::{CallTrace, LineTrace, MAX_TRACE_ENTRIES};
 use crate::units::UNITS;
 use crate::values::Value;
 
@@ -328,6 +328,54 @@ pub fn trace_call(
     profile: &SemanticsProfile,
     options: &EvaluationOptions,
 ) -> Result<CallTrace, String> {
+    let (call, _) = follow(line, path, false, profile, options)?;
+    let mut call: CallTrace = call.ok_or("that call didn't run")?;
+    place(&mut call, documents);
+    Ok(call)
+}
+
+/// Like `trace_call`, for every run of the last call (its run in `path` doesn't matter), keeping only the entries
+/// of `points` and of the loops around them, and `MAX_TRACE_ENTRIES` of those in all.
+pub fn trace_call_runs(
+    line: &WorksheetLine,
+    documents: &[WorksheetDocument],
+    path: &[(usize, usize)],
+    points: &[usize],
+    profile: &SemanticsProfile,
+    options: &EvaluationOptions,
+) -> Result<Vec<CallTrace>, String> {
+    let (_, mut runs) = follow(line, path, true, profile, options)?;
+    let mut total: usize = 0;
+    for (index, call) in runs.iter_mut().enumerate() {
+        let mut kept: Vec<usize> = points.to_vec();
+        for point in points {
+            if let Some(found) = call.trace.points.get(*point) {
+                kept.extend(&found.loops);
+            }
+        }
+        call.trace.entries.retain(|entry| kept.contains(&entry.point));
+        call.trace.call_entries.clear();
+        total += call.trace.entries.len();
+        if total > MAX_TRACE_ENTRIES {
+            call.trace.is_truncated = true;
+            runs.truncate(index + 1);
+            break;
+        }
+    }
+    for call in &mut runs {
+        place(call, documents);
+    }
+    Ok(runs)
+}
+
+/// Re-runs a line from the values it started with, following `path` (see `Evaluator::follow_call`).
+fn follow(
+    line: &WorksheetLine,
+    path: &[(usize, usize)],
+    is_every_run: bool,
+    profile: &SemanticsProfile,
+    options: &EvaluationOptions,
+) -> Result<(Option<CallTrace>, Vec<CallTrace>), String> {
     let (Some(bound), Some(program)) = (&line.result.line, &line.result.program) else {
         return Err("the line didn't run".to_string());
     };
@@ -341,14 +389,20 @@ pub fn trace_call(
         evaluator.zero_globals(program);
     }
     storage.extend(line.result.inputs.iter().map(|(variable, value)| (variable.clone(), value.clone())));
-    let mut call: CallTrace = {
-        let mut evaluator: Evaluator = Evaluator::new(profile, options, &mut storage, &mut diagnostics, &line.document);
-        evaluator.set_current_source(&line.document);
+    let mut evaluator: Evaluator = Evaluator::new(profile, options, &mut storage, &mut diagnostics, &line.document);
+    evaluator.set_current_source(&line.document);
+    if is_every_run {
+        evaluator.follow_every_call(statement, path.to_vec());
+    } else {
         evaluator.follow_call(statement, path.to_vec());
-        // What the line does after the call doesn't matter
-        let _ = evaluator.run(bound);
-        evaluator.take_call_trace().ok_or("that call didn't run")?
-    };
+    }
+    // What the line does after the call doesn't matter
+    let _ = evaluator.run(bound);
+    Ok(if is_every_run { (None, evaluator.take_call_runs()) } else { (evaluator.take_call_trace(), Vec::new()) })
+}
+
+/// A traced call's lines in its function's document.
+fn place(call: &mut CallTrace, documents: &[WorksheetDocument]) {
     let source: String = call.function.source_name();
     let starts: Option<Vec<usize>> =
         documents.iter().find(|document| document.name == source).map(|document| line_starts(&document.text));
@@ -356,7 +410,6 @@ pub fn trace_call(
     call.first_line = span.line;
     call.last_line = last_line_of(span, starts.as_ref());
     fill_trace_lines(&mut call.trace, starts.as_ref());
-    Ok(call)
 }
 
 /// UTF-16 offsets where each line starts.

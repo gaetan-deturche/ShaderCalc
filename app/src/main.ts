@@ -110,6 +110,10 @@ function addTab(name: string, text: string, index: number = -1): WorksheetView {
     completions: completionEntries,
     traceCall: (line: Line, path: CallPath) => call<CallTrace | null>("traceCall", { generation: latestGeneration, index: line.index, path }),
     checkCall: (line: Line, path: CallPath) => call<Reference | null>("checkCall", { generation: latestGeneration, index: line.index, path }),
+    traceCallRuns: (line: Line, path: CallPath, points: number[]) =>
+      call<CallTrace[] | null>("traceCallRuns", { generation: latestGeneration, index: line.index, path, points }),
+    checkCallRuns: (line: Line, path: CallPath, points: number[]) =>
+      call<Reference | null>("checkCallRuns", { generation: latestGeneration, index: line.index, path, points }),
     documentText: (name: string) => views.find((candidate: WorksheetView) => candidate.name === name)?.text ?? null,
     intrinsics,
     resultWidth,

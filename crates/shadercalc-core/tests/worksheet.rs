@@ -334,6 +334,21 @@ fn a_call_is_traced_on_demand() {
         assert_eq!(ReferenceVerdict::Match, outcome.verdict, "{outcome}\n{}", outcome.hlsl);
         assert_eq!(call.trace.entries.len(), outcome.trace.len());
     }
+    // Every run of Sum, keeping `total += Twice(i)` (point 2) and its loop: one shader checks them all
+    let runs: Vec<CallTrace> = worksheet::trace_call_runs(
+        line,
+        &documents,
+        &[(0, 0)],
+        &[2],
+        &SemanticsProfile::HLSL,
+        &EvaluationOptions::default(),
+    )
+    .expect("traced");
+    let described: Vec<Vec<String>> = runs.iter().map(describe).collect();
+    assert_eq!(vec![vec!["5 [0] 0", "5 [0] 0.5"], vec!["5 [0] 0", "5 [0] 0.5", "5 [1] 1", "5 [1] 2.5"]], described);
+    let outcome: ReferenceOutcome =
+        checker::check_call_runs(&line.result, &[(0, 0)], &runs, &[2], ReferenceMode::Strict);
+    assert_eq!((ReferenceVerdict::Match, 6), (outcome.verdict, outcome.trace.len()), "{outcome}\n{}", outcome.hlsl);
     // A run that doesn't exist
     assert!(
         worksheet::trace_call(line, &documents, &[(0, 2)], &SemanticsProfile::HLSL, &EvaluationOptions::default())
