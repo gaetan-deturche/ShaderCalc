@@ -5,6 +5,13 @@ export interface DocumentText {
   text: string;
 }
 
+/** A newer release, from the updater. */
+export interface UpdateInfo {
+  version: string;
+  current: string;
+  notes: string;
+}
+
 export interface Profile {
   id: string;
   label: string;

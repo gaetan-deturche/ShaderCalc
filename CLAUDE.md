@@ -118,6 +118,19 @@ component is raw `u64` bits plus a `UnitTag`).
   (`include_bytes!`), unpacks them to `%LOCALAPPDATA%\ShaderCalc\dxc-<sizes>\` and sets `SHADERCALC_DXC_DIR` unless
   it is already set. The exe is ~30 MB.
 - Icons: `app/icon.png` (window/page), `app/src-tauri/icons/` (exe).
+- Updates (`app/src-tauri/src/update.rs`): `check_update` reads GitHub's latest release, which carries the exe,
+  `update.json` (`{version, notes, exe: {name, size, sha256}}`) and `update.json.sig` (base64 ed25519 of
+  update.json's bytes). The signature is verified against `update-public-key.txt` (base64 raw key,
+  `include_str!`; empty = updates off, the state of every local build). `install_update` downloads the exe,
+  checks size + SHA-256, renames the running exe to `.exe.old` and puts the new one in place. `restart_app` starts
+  it with `--updated-from <pid>`: `finish_update` (start of `main`) waits for that process, then deletes `.old`.
+  The frontend checks 3 s after start and every 6 h (Tauri only); the status bar button goes "Update to X" →
+  "Restart to update". `SHADERCALC_UPDATE_URL` replaces the GitHub URL (tests); the signature is still required.
+- Release: `scripts/bump-version.ps1 X.Y.Z` (tauri.conf.json, app Cargo.toml, package.json, the locks), commit,
+  tag `vX.Y.Z`, push the tag. `.github/workflows/release.yml` checks the tag against the versions, tests, builds,
+  signs with `scripts/sign-release.mjs manifest` (key from the `SHADERCALC_SIGNING_KEY` secret) and runs
+  `gh release create`. `scripts/new-signing-key.ps1` makes the key once (the user runs it: the private key goes
+  to `gh secret set`, never to a file or to Claude).
 
 ## Build / test
 
@@ -147,6 +160,12 @@ component is raw `u64` bits plus a `UnitTag`).
   before accepting a completion: CodeMirror ignores Enter for 75 ms after the list opens.
 - The watchdog only acts on the PIDs drivers write to `Claude/out/app.pid`, so a ShaderCalc the user runs is never
   killed. It kills the run's app if a window of it shows up on the user's desktop.
+- Update test: `Claude/update-test/prepare.ps1` builds two exes (the crate's version and one patch above) with a
+  throwaway key, signs the second and writes a fake latest release; it restores the repository files it touched.
+  Serve `Claude/out/update-test/release` on http://127.0.0.1:8765, then
+  `run-hidden.ps1 -Driver update-drive.ps1` (update, restart, `.old` removed) and
+  `-DriverArguments '-Tampered'` after altering the served update.json (no offer, exe untouched). Rebuild the
+  normal exe afterwards: the last build has the test key in it.
 - Corpus against WARP: `Claude/diff/` (`make_corpus.py` → `corpus.json`, `rust/` runner). `DIFF_DETAILS=1` prints
   WARP's value and why a line wasn't checked; `mismatches.py` lists the lines without a ✓, `changes.py` diffs two
   runs. The C# runner (`csharp/`) needs a checkout of `5671300`.

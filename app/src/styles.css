@@ -215,6 +215,19 @@ select {
   margin-right: 10px;
 }
 
+/* The update notice in the status bar */
+.status .update {
+  padding: 0 8px;
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-size: inherit;
+}
+
+.status .update:hover {
+  text-decoration: underline;
+}
+
 .editors {
   flex: 1;
   min-height: 0;

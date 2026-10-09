@@ -32,6 +32,10 @@ tanh(7.0)                                  // ⊘ 0.99999833 (WARP's tanh is off
 
 Worksheets live in `~/.shadercalc` (one `.hlsl` per tab, edits made outside the app reload live).
 
+The exe is portable: download `shadercalc.exe` from the
+[latest release](https://github.com/gaetan-deturche/ShaderCalc/releases/latest) and run it. When a newer release
+is out, the status bar offers it; the app checks its signature, replaces its own exe and restarts on a click.
+
 ## Build
 
 Requires Windows 10/11 (WARP and WebView2 ship with Windows), a current stable Rust and Node.js 22+.
@@ -55,6 +59,24 @@ cargo run -p shadercalc-devserver
 cd app
 npm run dev
 ```
+
+## Releasing
+
+Once: `scripts\new-signing-key.ps1` creates the update signing key. Its private half goes straight into the
+repository's `SHADERCALC_SIGNING_KEY` Actions secret; its public half is written to
+`app/src-tauri/update-public-key.txt` and must be committed (a build without it never updates).
+
+Each release:
+
+```
+powershell -File scripts\bump-version.ps1 1.2.3
+git commit -am "Version 1.2.3"
+git tag v1.2.3
+git push origin main v1.2.3
+```
+
+The tag starts `.github/workflows/release.yml`: it tests, builds the exe, signs `update.json` and publishes the
+GitHub release, with the commits since the previous tag as notes.
 
 ## Credits
 

@@ -3,6 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 /** Whether the page runs inside the Tauri app (otherwise: a browser talking to the dev server). */
 export const isTauri: boolean = "__TAURI_INTERNALS__" in window;
 
+/** Runs one of the app's own commands (the updater); only inside the Tauri app. */
+export async function appCommand<T>(command: string, args: object = {}): Promise<T> {
+  return invoke<T>(command, { ...args });
+}
+
 /** Runs a backend command: Tauri IPC in the app, `POST /api/<command>` in a browser. */
 export async function call<T>(command: string, args: object = {}): Promise<T> {
   if (isTauri) {

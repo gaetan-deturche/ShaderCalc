@@ -1,9 +1,9 @@
 import "./styles.css";
-import { call, isTauri } from "./api";
+import { appCommand, call, isTauri } from "./api";
 import { DocsPanel } from "./docs";
 import { COMMON_TYPES, KEYWORDS } from "./hlsl";
 import { buildInspector, emptyInspector } from "./inspector";
-import { DocEntry, DocumentText, Evaluation, Line, LoadResult, OutsideChanges, Profile, Reference } from "./types";
+import { DocEntry, DocumentText, Evaluation, Line, LoadResult, OutsideChanges, Profile, Reference, UpdateInfo } from "./types";
 import { CompletionEntry, WorksheetView } from "./worksheet-view";
 
 const EXTENSION: string = ".hlsl";
@@ -423,6 +423,67 @@ function setupLayout(sideWidth: number): void {
   });
 }
 
+// ---------------------------------------------------------------- Updates (the app only)
+
+const updateButton: HTMLButtonElement = document.getElementById("update-status") as HTMLButtonElement;
+let updateStep: "available" | "installing" | "installed" | "failed" = "available";
+let offeredUpdate: UpdateInfo | null = null;
+
+function showUpdate(text: string, title: string, step: typeof updateStep): void {
+  updateButton.textContent = text;
+  updateButton.title = title;
+  updateButton.disabled = step === "installing";
+  updateButton.classList.remove("hidden");
+  updateStep = step;
+}
+
+async function checkForUpdate(): Promise<void> {
+  if (updateStep === "installing" || updateStep === "installed") {
+    return;
+  }
+  try {
+    offeredUpdate = await appCommand<UpdateInfo | null>("check_update");
+  } catch (error) {
+    // Offline or GitHub unreachable: say nothing, the next check may work
+    console.warn(`update check: ${error}`);
+    return;
+  }
+  if (offeredUpdate === null) {
+    updateButton.classList.add("hidden");
+    return;
+  }
+  showUpdate(
+    `Update to ${offeredUpdate.version}`,
+    `ShaderCalc ${offeredUpdate.version} is available (this is ${offeredUpdate.current}). Click to download and install it.
+
+${offeredUpdate.notes}`,
+    "available",
+  );
+}
+
+async function onUpdateClick(): Promise<void> {
+  if (updateStep === "installed") {
+    await saveUnsaved();
+    await saveState();
+    await appCommand("restart_app");
+    return;
+  }
+  if (updateStep === "failed") {
+    updateStep = "available";
+    await checkForUpdate();
+    return;
+  }
+  showUpdate(`Downloading ${offeredUpdate?.version ?? ""}…`, "Downloading and checking the update", "installing");
+  try {
+    await appCommand("install_update");
+    showUpdate("Restart to update", `ShaderCalc ${offeredUpdate?.version ?? ""} is installed: click to restart into it (the worksheets are saved first)`, "installed");
+  } catch (error) {
+    showUpdate("Update failed", `${error}
+
+Click to check again.`, "failed");
+  }
+}
+
 // ---------------------------------------------------------------- Keys and startup
 
 function onKeyDown(event: KeyboardEvent): void {
@@ -475,12 +536,17 @@ async function start(): Promise<void> {
   inspector.replaceChildren(emptyInspector());
   await runEvaluation();
   window.setInterval(() => void pollChanges(), 1000);
+  if (isTauri) {
+    window.setTimeout(() => void checkForUpdate(), 3000);
+    window.setInterval(() => void checkForUpdate(), 6 * 60 * 60 * 1000);
+  }
 }
 
 document.getElementById("new-button")?.addEventListener("click", () => void newWorksheet());
 document.getElementById("rename-button")?.addEventListener("click", () => void renameActive());
 document.getElementById("delete-button")?.addEventListener("click", () => void deleteActive());
 document.getElementById("folder-button")?.addEventListener("click", () => void call("openFolder"));
+updateButton.addEventListener("click", () => void onUpdateClick());
 profileSelect.addEventListener("change", () => {
   profile = profileSelect.value;
   void saveState();

@@ -1,0 +1,68 @@
+# Pushing a tag vX.Y.Z (matching app/src-tauri/tauri.conf.json, see scripts/bump-version.ps1) builds ShaderCalc on
+# Windows, tests it (the reference tests need WARP, which Windows ships), signs the update manifest and publishes a
+# release the app's updater finds (app/src-tauri/src/update.rs).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check the version matches the tag
+        shell: pwsh
+        run: |
+          $version = (Get-Content app/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ("v$version" -ne "${{ github.ref_name }}") { throw "tauri.conf.json says $version, the tag is ${{ github.ref_name }}" }
+          # The updater compares with the app crate's version
+          if ((Get-Content app/src-tauri/Cargo.toml -Raw) -notmatch "(?m)^version = `"$version`"") { throw "app/src-tauri/Cargo.toml isn't at $version" }
+          if (-not (Get-Content app/src-tauri/update-public-key.txt -Raw)) { throw "No update public key: run scripts/new-signing-key.ps1" }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch DXC
+        shell: pwsh
+        run: ./scripts/fetch-dxc.ps1
+
+      - name: Test
+        run: cargo test --workspace --release
+
+      - name: Build
+        working-directory: app
+        run: |
+          npm ci
+          npx tauri build --no-bundle
+
+      - name: Sign the update
+        shell: pwsh
+        env:
+          SHADERCALC_SIGNING_KEY: ${{ secrets.SHADERCALC_SIGNING_KEY }}
+        run: |
+          $version = (Get-Content app/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $previous = git describe --tags --abbrev=0 "${{ github.ref_name }}^" 2>$null
+          $range = if ($previous) { "$previous..${{ github.ref_name }}" } else { "${{ github.ref_name }}" }
+          git log --format="- %s" $range | Out-File -Encoding utf8 notes.md
+          node scripts/sign-release.mjs manifest $version target/release/shadercalc.exe release notes.md
+
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" target/release/shadercalc.exe release/update.json release/update.json.sig --title "ShaderCalc ${{ github.ref_name }}" --notes-file notes.md
