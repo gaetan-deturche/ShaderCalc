@@ -2,7 +2,7 @@ use shadercalc_core::evaluation::evaluator::EvaluationOptions;
 use shadercalc_core::reference::checker::{self, ReferenceOutcome, ReferenceVerdict};
 use shadercalc_core::reference::warp_device::ReferenceMode;
 use shadercalc_core::semantics::SemanticsProfile;
-use shadercalc_core::trace::LineTrace;
+use shadercalc_core::trace::{CallTrace, LineTrace};
 use shadercalc_core::worksheet::{self, WorksheetDocument, WorksheetLine, WorksheetResult};
 
 pub fn run(documents: &[(&str, &str)]) -> WorksheetResult {
@@ -214,7 +214,7 @@ fn loops_trace_every_iteration() {
 fn loop_values_are_checked_on_warp() {
     let result: WorksheetResult = run(&[(
         "main.hlsl",
-        "float total = 0.1f\nfor (int i = 0; i < 4; ++i)\n{\n    float3 v = float3(i, total, 2.5f) * 0.3f;\n    total += sqrt(v.y + 1.0f);\n    double d = i * 0.1L;\n    if (i == 2) { uint64_t big = 0x100000000ull * i; }\n}\nfor (int k = 0; k < 2; ++k) { tanh(7.0f + k); }",
+        "float total = 0.1f\nfor (int i = 0; i < 4; ++i)\n{\n    float3 v = float3(i, total, 2.5f) * 0.3f;\n    total += sqrt(v.y + 1.0f);\n    double d = i * 0.1L;\n    if (i == 2) { uint64_t big = 0x100000000ull * i; }\n    if (i == 1)\n        total *= 0.5f;\n}\nfor (int k = 0; k < 2; ++k) { tanh(7.0f + k); }",
     )]);
     assert_no_errors(&result);
     let verdicts = |line: &WorksheetLine| -> (ReferenceVerdict, Vec<ReferenceVerdict>, usize) {
@@ -222,9 +222,9 @@ fn loop_values_are_checked_on_warp() {
         let entries: usize = line.result.trace.as_ref().map_or(0, |trace| trace.entries.len());
         (outcome.verdict, outcome.trace.iter().map(|check| check.verdict).collect(), entries)
     };
-    // 4 iterations of (i, v, total, d), and big once
+    // 4 iterations of (i, v, total, d), big once, the unbraced if's total once
     let (verdict, checks, entries) = verdicts(&result.lines[1]);
-    assert_eq!((ReferenceVerdict::Match, 17, 17), (verdict, checks.len(), entries), "{checks:?}");
+    assert_eq!((ReferenceVerdict::Match, 18, 18), (verdict, checks.len(), entries), "{checks:?}");
     assert!(checks.iter().all(|check| *check == ReferenceVerdict::Match));
     // WARP's tanh is off: those entries are WARP limits, the loop variable's still match
     let (verdict, checks, _) = verdicts(&result.lines[2]);
@@ -237,6 +237,107 @@ fn loop_values_are_checked_on_warp() {
             ReferenceVerdict::WarpLimit
         ],
         checks
+    );
+}
+
+#[test]
+fn a_line_shows_every_variable_it_writes() {
+    let result: WorksheetResult = run(&[(
+        "main.hlsl",
+        "float a = 1, b = 2\na = b = 3\nvoid Split(float v, out float whole, inout float count) { whole = floor(v); count += 1; }\nfloat s = 0, c = 0, w = 0, n = 0\nfor (int i = 0; i < 2; ++i)\n{\n    sincos(i * 0.5f, s, c);\n    Split(i + 1.25f, w, n);\n}",
+    )]);
+    assert_no_errors(&result);
+    let written = |line: &WorksheetLine| -> Vec<String> {
+        let trace: &LineTrace = line.result.trace.as_ref().expect("traced");
+        trace
+            .entries
+            .iter()
+            .map(|entry| {
+                let names: &[shadercalc_core::binding::symbols::VariableRef] =
+                    trace.points[entry.point].kind.variables();
+                let pairs: Vec<String> = entry
+                    .values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| match names.get(index) {
+                        Some(variable) => format!("{} = {value}", variable.name),
+                        None => value.to_string(),
+                    })
+                    .collect();
+                format!("{:?} {}", entry.iterations, pairs.join(", "))
+            })
+            .collect()
+    };
+    assert_eq!(vec!["[] a = 1", "[] b = 2"], written(&result.lines[0]));
+    assert_eq!(vec!["[] a = 3, b = 3"], written(&result.lines[1]));
+    let looped: Vec<String> = written(&result.lines[3]);
+    assert_eq!(6, looped.len(), "{looped:#?}");
+    assert_eq!(["[0] i = 0", "[0] s = 0, c = 1", "[0] w = 1, n = 1"], looped[..3]);
+    assert!(looped[5] == "[1] w = 2, n = 2" && looped[4].starts_with("[1] s = 0.47"), "{looped:#?}");
+    // WARP agrees on every variable (sincos may be approximate)
+    for line in [&result.lines[0], &result.lines[1], &result.lines[3]] {
+        let outcome: ReferenceOutcome = checker::check(&line.result, ReferenceMode::Strict);
+        assert!(
+            matches!(outcome.verdict, ReferenceVerdict::Match | ReferenceVerdict::WithinTolerance),
+            "{outcome}\n{}",
+            outcome.hlsl
+        );
+        assert_eq!(line.result.trace.as_ref().map_or(0, |trace| trace.entries.len()), outcome.trace.len());
+    }
+}
+
+#[test]
+fn a_call_is_traced_on_demand() {
+    let text: &str = "float Sum(float x, int count)\n{\n    float total = x;\n    for (int i = 0; i < count; ++i)\n        total += Twice(i);\n    return total;\n}\nfloat Twice(float y) { return 2 * y; }\nfor (int k = 1; k < 3; ++k)\n{\n    Sum(0.5, k);\n}";
+    let documents: Vec<WorksheetDocument> = vec![WorksheetDocument::new("main.hlsl", text)];
+    let result: WorksheetResult =
+        worksheet::evaluate(&documents, &SemanticsProfile::HLSL, &EvaluationOptions::default()).expect("ran");
+    assert_no_errors(&result);
+    let line: &WorksheetLine = &result.lines[0];
+    let trace: &LineTrace = line.result.trace.as_ref().expect("traced");
+    let sites: Vec<String> =
+        trace.calls.iter().map(|site| format!("{} {}", site.function.name, site.last_line)).collect();
+    assert_eq!(vec!["Sum 11"], sites);
+    let runs: Vec<Vec<u32>> = trace.call_entries.iter().map(|entry| entry.iterations.clone()).collect();
+    assert_eq!(vec![vec![0], vec![1]], runs);
+
+    let follow = |path: &[(usize, usize)]| -> CallTrace {
+        worksheet::trace_call(line, &documents, path, &SemanticsProfile::HLSL, &EvaluationOptions::default())
+            .expect("traced")
+    };
+    let describe = |call: &CallTrace| -> Vec<String> {
+        call.trace
+            .entries
+            .iter()
+            .map(|entry| {
+                let point: usize = call.trace.points[entry.point].last_line;
+                let values: Vec<String> = entry.values.iter().map(ToString::to_string).collect();
+                format!("{point} {:?} {}", entry.iterations, values.join(","))
+            })
+            .collect()
+    };
+    // The second run of Sum (k = 2)
+    let sum: CallTrace = follow(&[(0, 1)]);
+    assert_eq!((1, 7), (sum.first_line, sum.last_line));
+    let arguments: Vec<String> = sum.arguments.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        (vec!["0.5", "2"], Some("2.5".to_string())),
+        (arguments.iter().map(String::as_str).collect(), sum.result.as_ref().map(ToString::to_string))
+    );
+    assert_eq!(vec!["3 [] 0.5", "5 [0] 0", "5 [0] 0.5", "5 [1] 1", "5 [1] 2.5", "6 [] 2.5"], describe(&sum));
+    // Inside it, the second run of Twice
+    let twice: CallTrace = follow(&[(0, 1), (0, 1)]);
+    assert_eq!(("Twice", vec!["8 [] 2".to_string()]), (twice.function.name.as_str(), describe(&twice)));
+    // Both checked on WARP, value by value
+    for (path, call) in [(vec![(0, 1)], &sum), (vec![(0, 1), (0, 1)], &twice)] {
+        let outcome: ReferenceOutcome = checker::check_call(&line.result, &path, call, ReferenceMode::Strict);
+        assert_eq!(ReferenceVerdict::Match, outcome.verdict, "{outcome}\n{}", outcome.hlsl);
+        assert_eq!(call.trace.entries.len(), outcome.trace.len());
+    }
+    // A run that doesn't exist
+    assert!(
+        worksheet::trace_call(line, &documents, &[(0, 2)], &SemanticsProfile::HLSL, &EvaluationOptions::default())
+            .is_err()
     );
 }
 

@@ -14,10 +14,11 @@ use shadercalc_core::evaluation::evaluator::EvaluationOptions;
 use shadercalc_core::reference::checker;
 use shadercalc_core::reference::warp_device::ReferenceMode;
 use shadercalc_core::semantics::SemanticsProfile;
+use shadercalc_core::trace::CallTrace;
 use shadercalc_core::units::UNITS;
-use shadercalc_core::worksheet::{self, WorksheetDocument, WorksheetResult};
+use shadercalc_core::worksheet::{self, WorksheetDocument, WorksheetLine, WorksheetResult};
 
-use dto::{DiagnosticDto, DocDto, EvaluationDto, ExportDto, LineDto, ReferenceDto, SymbolDto};
+use dto::{CallTraceDto, DiagnosticDto, DocDto, EvaluationDto, ExportDto, LineDto, ReferenceDto, SymbolDto};
 use store::{OutsideChanges, WorksheetStore};
 
 #[derive(Deserialize)]
@@ -36,12 +37,15 @@ struct StateArgument {
     profile: String,
 }
 
+/// An evaluation's generation, result, documents and profile.
+type Evaluated = (u64, Arc<WorksheetResult>, Arc<Vec<WorksheetDocument>>, &'static SemanticsProfile);
+
 pub struct Backend {
     store: Mutex<WorksheetStore>,
     generation: AtomicU64,
     cancellation: Mutex<Arc<AtomicBool>>,
-    /// The latest evaluation and its profile, for its reference checks.
-    last: Mutex<Option<(u64, Arc<WorksheetResult>, &'static SemanticsProfile)>>,
+    /// The latest evaluation, for its reference checks and call traces.
+    last: Mutex<Option<Evaluated>>,
 }
 
 fn argument<'a, T: Deserialize<'a>>(arguments: &'a Json, name: &str) -> Result<T, String> {
@@ -127,6 +131,18 @@ impl Backend {
                 let generation: u64 = argument(arguments, "generation")?;
                 let index: usize = argument(arguments, "index")?;
                 self.check_reference(generation, index)
+            }
+            "traceCall" => {
+                let generation: u64 = argument(arguments, "generation")?;
+                let index: usize = argument(arguments, "index")?;
+                let path: Vec<(usize, usize)> = argument(arguments, "path")?;
+                self.trace_call(generation, index, &path)
+            }
+            "checkCall" => {
+                let generation: u64 = argument(arguments, "generation")?;
+                let index: usize = argument(arguments, "index")?;
+                let path: Vec<(usize, usize)> = argument(arguments, "path")?;
+                self.check_call(generation, index, &path)
             }
             "docs" => {
                 let entries: Vec<DocDto> = docs::entries().iter().map(DocDto::from).collect();
@@ -217,15 +233,52 @@ impl Backend {
             symbols,
             exports: result.exports.iter().map(ExportDto::from).collect(),
         };
-        *self.last.lock().expect("evaluation lock") = Some((generation, Arc::new(result), profile));
+        *self.last.lock().expect("evaluation lock") =
+            Some((generation, Arc::new(result), Arc::new(documents), profile));
         serde_json::to_value(evaluation).map_err(|error| error.to_string())
+    }
+
+    /// What one call made by a line of an evaluation computed (`path`: see `worksheet::trace_call`); null when a
+    /// newer evaluation replaced it.
+    fn trace_call(&self, generation: u64, index: usize, path: &[(usize, usize)]) -> Result<Json, String> {
+        let (result, documents, profile) = match &*self.last.lock().expect("evaluation lock") {
+            Some((last, result, documents, profile)) if *last == generation => {
+                (result.clone(), documents.clone(), *profile)
+            }
+            _ => return Ok(Json::Null),
+        };
+        let line: &WorksheetLine = result.lines.get(index).ok_or_else(|| format!("no line {index}"))?;
+        let call: CallTrace = worksheet::trace_call(line, &documents, path, profile, &EvaluationOptions::default())?;
+        serde_json::to_value(CallTraceDto::from(&call)).map_err(|error| error.to_string())
+    }
+
+    /// The reference check of one call made by a line of an evaluation; null when a newer evaluation replaced it.
+    fn check_call(&self, generation: u64, index: usize, path: &[(usize, usize)]) -> Result<Json, String> {
+        let (result, documents, profile) = match &*self.last.lock().expect("evaluation lock") {
+            Some((last, result, documents, profile)) if *last == generation => {
+                (result.clone(), documents.clone(), *profile)
+            }
+            _ => return Ok(Json::Null),
+        };
+        let line: &WorksheetLine = result.lines.get(index).ok_or_else(|| format!("no line {index}"))?;
+        let outcome = if profile.has_reference() {
+            let call: CallTrace =
+                worksheet::trace_call(line, &documents, path, profile, &EvaluationOptions::default())?;
+            checker::check_call(&line.result, path, &call, ReferenceMode::Strict)
+        } else {
+            checker::not_checked(
+                format!("DXC + WARP check the HLSL profile only, not {}", profile.label),
+                String::new(),
+            )
+        };
+        serde_json::to_value(ReferenceDto::from(&outcome)).map_err(|error| error.to_string())
     }
 
     /// The reference check of one line of an evaluation; null when a newer evaluation replaced it.
     fn check_reference(&self, generation: u64, index: usize) -> Result<Json, String> {
         let (result, profile): (Arc<WorksheetResult>, &'static SemanticsProfile) =
             match &*self.last.lock().expect("evaluation lock") {
-                Some((last, result, profile)) if *last == generation => (result.clone(), *profile),
+                Some((last, result, _, profile)) if *last == generation => (result.clone(), *profile),
                 _ => return Ok(Json::Null),
             };
         let Some(line) = result.lines.get(index) else {

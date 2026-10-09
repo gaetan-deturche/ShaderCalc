@@ -2,9 +2,10 @@
 
 use std::collections::HashMap;
 
-use crate::binding::bound_tree::{BoundExpressionKind, BoundStatement, BoundStatementKind};
-use crate::binding::symbols::VariableRef;
+use crate::binding::bound_tree::{BoundExpression, BoundExpressionKind, BoundStatement, BoundStatementKind};
+use crate::binding::symbols::{FunctionRef, VariableRef};
 use crate::diagnostics::SourceSpan;
+use crate::syntax::tree::ParameterMode;
 use crate::types::ShaderType;
 use crate::values::Value;
 
@@ -13,7 +14,9 @@ pub const MAX_TRACE_ENTRIES: usize = 4_096;
 
 #[derive(Clone, Debug)]
 pub enum TracePointKind {
-    /// A declaration or an expression statement: the value it produces.
+    /// A statement that writes variables (declares, assigns, increments, passes as out/inout): their values after it.
+    Writes { variables: Vec<VariableRef> },
+    /// An expression statement writing nothing, or a return: its value.
     Value { ty: ShaderType },
     /// A loop: each iteration, the variables its initializer declares (or assigns).
     Loop { variables: Vec<VariableRef> },
@@ -45,14 +48,70 @@ pub struct LineTrace {
     pub entries: Vec<TraceEntry>,
     /// More than `MAX_TRACE_ENTRIES` ran: only the first are kept.
     pub is_truncated: bool,
+    /// The worksheet functions the traced code calls, and each time it did.
+    pub calls: Vec<CallSite>,
+    pub call_entries: Vec<CallEntry>,
 }
 
-impl TracePoint {
-    /// The types of the values its entries hold.
-    pub fn value_types(&self) -> Vec<ShaderType> {
-        match &self.kind {
-            TracePointKind::Value { ty } => vec![ty.clone()],
-            TracePointKind::Loop { variables } => variables.iter().map(|variable| variable.ty.clone()).collect(),
+/// A call to a worksheet function in the traced code (numbered in pre-order, like the points).
+#[derive(Clone, Debug)]
+pub struct CallSite {
+    pub function: FunctionRef,
+    pub span: SourceSpan,
+    pub first_line: usize,
+    pub last_line: usize,
+}
+
+/// One run of a call site: its iteration in each enclosing loop. A site's n-th entry is its n-th run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CallEntry {
+    pub site: usize,
+    pub iterations: Vec<u32>,
+}
+
+/// What one call of a worksheet function computed: its arguments, its body's trace, its result.
+#[derive(Clone, Debug)]
+pub struct CallTrace {
+    pub function: FunctionRef,
+    /// Its parameters as the call set them.
+    pub arguments: Vec<Value>,
+    /// None for a void function, or a call that failed.
+    pub result: Option<Value>,
+    pub trace: LineTrace,
+    /// The lines of the function's definition in its document.
+    pub first_line: usize,
+    pub last_line: usize,
+}
+
+/// The calls to worksheet functions in a statement's expressions, in pre-order, with the node of each.
+pub fn call_sites(statement: &BoundStatement) -> (Vec<CallSite>, HashMap<*const BoundExpression, usize>) {
+    fn visit(
+        expression: &BoundExpression,
+        sites: &mut Vec<CallSite>,
+        ids: &mut HashMap<*const BoundExpression, usize>,
+    ) {
+        if let BoundExpressionKind::Call { function, .. } = &expression.kind {
+            ids.insert(expression as *const BoundExpression, sites.len());
+            sites.push(CallSite { function: function.clone(), span: expression.span, first_line: 0, last_line: 0 });
+        }
+        for child in expression.children() {
+            visit(child, sites, ids);
+        }
+    }
+    let mut sites: Vec<CallSite> = Vec::new();
+    let mut ids: HashMap<*const BoundExpression, usize> = HashMap::new();
+    for expression in statement.expressions() {
+        visit(expression, &mut sites, &mut ids);
+    }
+    (sites, ids)
+}
+
+impl TracePointKind {
+    /// The variables its entries hold, in order (none for a plain value).
+    pub fn variables(&self) -> &[VariableRef] {
+        match self {
+            TracePointKind::Writes { variables } | TracePointKind::Loop { variables } => variables,
+            TracePointKind::Value { .. } => &[],
         }
     }
 }
@@ -66,7 +125,8 @@ pub fn trace_points(statement: &BoundStatement) -> (Vec<TracePoint>, HashMap<*co
     (points, ids)
 }
 
-/// `is_nested`: inside a loop body, an if, a switch or braces, where a statement's value isn't the line's.
+/// `is_nested`: inside a loop body, an if, a switch or braces, where a statement's value isn't the line's. A line
+/// writing several variables (`float a = 1, b = 2`, `a = b = 3`) is traced too: its value alone shows only one.
 fn walk(
     statement: &BoundStatement,
     is_nested: bool,
@@ -82,19 +142,28 @@ fn walk(
     };
     match &statement.kind {
         BoundStatementKind::Block { statements, is_scope } => {
+            // `float a, b;` is a block of declarations, without braces
+            let is_several: bool = statements.len() > 1;
             for inner in statements {
-                walk(inner, is_nested || *is_scope, loops, points, ids);
+                walk(inner, is_nested || *is_scope || is_several, loops, points, ids);
             }
         }
         BoundStatementKind::VariableDeclaration { variable, .. } if is_nested => {
-            add(TracePointKind::Value { ty: variable.ty.clone() }, loops);
+            add(TracePointKind::Writes { variables: vec![variable.clone()] }, loops);
         }
-        BoundStatementKind::Expression(expression)
-            if is_nested
-                && !expression.ty.is_void()
-                && !expression.ty.component_kinds().iter().any(|kind| kind.is_literal()) =>
-        {
-            add(TracePointKind::Value { ty: expression.ty.clone() }, loops);
+        BoundStatementKind::Expression(expression) => {
+            let mut variables: Vec<VariableRef> = Vec::new();
+            written_variables(expression, &mut variables);
+            let is_value: bool =
+                !expression.ty.is_void() && !expression.ty.component_kinds().iter().any(|kind| kind.is_literal());
+            if (is_nested && !variables.is_empty()) || variables.len() > 1 {
+                add(TracePointKind::Writes { variables }, loops);
+            } else if is_nested && is_value {
+                add(TracePointKind::Value { ty: expression.ty.clone() }, loops);
+            }
+        }
+        BoundStatementKind::Return(Some(value)) if is_nested => {
+            add(TracePointKind::Value { ty: value.ty.clone() }, loops);
         }
         BoundStatementKind::If { then, otherwise, .. } => {
             walk(then, true, loops, points, ids);
@@ -117,6 +186,51 @@ fn walk(
             }
         }
         _ => {}
+    }
+}
+
+/// The variables an expression writes, in the order met: assignment and increment targets, out/inout arguments
+/// (the whole variable for `v.x = ...`, `a[i] = ...`).
+fn written_variables(expression: &BoundExpression, found: &mut Vec<VariableRef>) {
+    fn root(target: &BoundExpression) -> Option<&VariableRef> {
+        match &target.kind {
+            BoundExpressionKind::Variable(variable) => Some(variable),
+            BoundExpressionKind::Swizzle { operand, .. }
+            | BoundExpressionKind::Index { operand, .. }
+            | BoundExpressionKind::Field { operand, .. }
+            | BoundExpressionKind::Conversion { operand, .. } => root(operand),
+            _ => None,
+        }
+    }
+    let mut add = |target: &BoundExpression| {
+        if let Some(variable) = root(target)
+            && !found.contains(variable)
+        {
+            found.push(variable.clone());
+        }
+    };
+    match &expression.kind {
+        BoundExpressionKind::Assignment { target, .. }
+        | BoundExpressionKind::CompoundAssignment { target, .. }
+        | BoundExpressionKind::Increment { target, .. } => add(target),
+        BoundExpressionKind::Call { function, arguments, .. } => {
+            for (parameter, argument) in function.parameters.iter().zip(arguments) {
+                if parameter.parameter_mode() != ParameterMode::In {
+                    add(argument);
+                }
+            }
+        }
+        BoundExpressionKind::IntrinsicCall { signature, arguments, .. } => {
+            for (mode, argument) in signature.modes.iter().zip(arguments) {
+                if *mode != ParameterMode::In {
+                    add(argument);
+                }
+            }
+        }
+        _ => {}
+    }
+    for child in expression.children() {
+        written_variables(child, found);
     }
 }
 

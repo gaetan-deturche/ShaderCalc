@@ -81,7 +81,10 @@ export interface Line {
   trace: Trace | null;
 }
 
-/** A statement inside a line's loops/ifs/blocks ("value"), or a loop with its variables. */
+/**
+ * A statement inside a line's loops/ifs/blocks ("value": the variables it writes, or its value when `variables` is
+ * empty), or a loop with its variables.
+ */
 export interface TracePoint {
   kind: "value" | "loop";
   firstLine: number;
@@ -89,6 +92,31 @@ export interface TracePoint {
   /** Enclosing loops (point indices), outermost first. */
   loops: number[];
   variables: string[];
+}
+
+/** A call to a worksheet function in the traced code. */
+export interface CallSite {
+  function: string;
+  firstLine: number;
+  lastLine: number;
+}
+
+/** A run of a call site; a site's n-th entry is its n-th run. */
+export interface CallEntry {
+  site: number;
+  iterations: number[];
+}
+
+/** One call's look inside: its function (document and lines), arguments, result and body trace. */
+export interface CallTrace {
+  function: string;
+  document: string;
+  firstLine: number;
+  lastLine: number;
+  parameters: string[];
+  arguments: ValueInfo[];
+  result: ValueInfo | null;
+  trace: Trace;
 }
 
 /** One execution of a point: its iteration in each enclosing loop (a loop's own entry: its iteration last). */
@@ -102,6 +130,8 @@ export interface Trace {
   points: TracePoint[];
   entries: TraceEntry[];
   isTruncated: boolean;
+  calls: CallSite[];
+  callEntries: CallEntry[];
 }
 
 /** The reference's verdict on a trace entry; its values only when they differ. */

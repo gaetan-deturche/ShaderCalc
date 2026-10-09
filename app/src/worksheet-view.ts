@@ -3,8 +3,10 @@ import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirro
 import { bracketMatching, indentOnInput, indentUnit, syntaxHighlighting } from "@codemirror/language";
 import { Diagnostic as LintDiagnostic, lintKeymap, setDiagnostics } from "@codemirror/lint";
 import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
-import { EditorState, Extension } from "@codemirror/state";
+import { Range, EditorState, Extension, StateEffect, StateField } from "@codemirror/state";
 import {
+  Decoration,
+  DecorationSet,
   drawSelection,
   EditorView,
   highlightActiveLine,
@@ -12,10 +14,14 @@ import {
   keymap,
   lineNumbers,
   ViewUpdate,
+  WidgetType,
 } from "@codemirror/view";
+import { StreamLanguage } from "@codemirror/language";
 import { hlslHighlight, hlslLanguage } from "./hlsl";
-import { IterationChoices, TraceIndex } from "./trace";
-import { Diagnostic, Line, Reference, Severity, TracePoint, Verdict } from "./types";
+import { markOf, worstVerdict } from "./marks";
+import { CallPath, Peek, PeekHooks, PeekSite } from "./peek";
+import { IterationChoices, TraceFocus, TraceIndex } from "./trace";
+import { CallTrace, Diagnostic, Line, Reference, Severity, TracePoint, Verdict } from "./types";
 
 /** A name the editor can complete: what it is (function, type...) and a description for the tooltip. */
 export interface CompletionEntry {
@@ -31,18 +37,48 @@ interface Cell {
   problem: Severity | null;
   details: string | null;
   line: Line | null;
-  /** Inside a traced line: the entry shown (null: didn't run in the chosen iteration), or a loop's stepper. */
-  trace?: { index: TraceIndex; entry: number | null; loop: number | null };
+  /** A traced line's cell: its statements' entries at the chosen iterations, and a loop's stepper. */
+  trace?: { index: TraceIndex; points: number[]; entries: (number | null)[]; loop: number | null };
+  /** The line calls worksheet functions: it can open a peek. */
+  hasCalls?: boolean;
   isDim?: boolean;
 }
 
-/** The trace point under the caret: what the Inspector lists. */
-export interface TraceFocus {
-  index: TraceIndex;
-  point: number;
-  /** The entry the chosen iterations select. */
-  entry: number | null;
-  source: string;
+/** Peeks under their lines, as block widgets. */
+const setPeeks = StateEffect.define<DecorationSet>();
+const peekField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update: (peeks: DecorationSet, transaction) => {
+    let updated: DecorationSet = peeks.map(transaction.changes);
+    for (const effect of transaction.effects) {
+      if (effect.is(setPeeks)) {
+        updated = effect.value;
+      }
+    }
+    return updated;
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
+
+class PeekWidget extends WidgetType {
+  readonly peek: Peek;
+
+  constructor(peek: Peek) {
+    super();
+    this.peek = peek;
+  }
+
+  eq(other: PeekWidget): boolean {
+    return other.peek === this.peek;
+  }
+
+  toDOM(): HTMLElement {
+    return this.peek.element;
+  }
+
+  ignoreEvent(): boolean {
+    return true;
+  }
 }
 
 interface CellPosition {
@@ -55,32 +91,12 @@ export interface WorksheetHooks {
   onEdit(view: WorksheetView): void;
   onSelect(view: WorksheetView): void;
   completions(): CompletionEntry[];
+  /** Looks inside a call a line makes (see `Peek`). */
+  traceCall(line: Line, path: CallPath): Promise<CallTrace | null>;
+  checkCall(line: Line, path: CallPath): Promise<Reference | null>;
+  documentText(name: string): string | null;
   intrinsics: string[];
   resultWidth: number;
-}
-
-/** The mark in front of a result: problems first, then the reference verdict. */
-export function markOf(problem: Severity | null, reference: { verdict: Verdict } | undefined, hasValue: boolean): { mark: string; kind: string } {
-  if (problem === "error") {
-    return { mark: "✗", kind: "error" };
-  }
-  if (reference?.verdict === "mismatch") {
-    return { mark: "≠", kind: "error" };
-  }
-  if (problem === "warning") {
-    return { mark: "⚠", kind: "warning" };
-  }
-  switch (reference?.verdict) {
-    case "match":
-      return { mark: "✓", kind: "match" };
-    case "withinTolerance":
-      return { mark: "≈", kind: "approximate" };
-    case "warpLimit":
-      return { mark: "⊘", kind: "warning" };
-    case "notChecked":
-      return { mark: "–", kind: "dim" };
-  }
-  return hasValue ? { mark: "…", kind: "dim" } : { mark: "", kind: "dim" };
 }
 
 function worstProblem(diagnostics: Diagnostic[]): Diagnostic | null {
@@ -118,6 +134,11 @@ export class WorksheetView {
   private lineCells: Map<number, Cell> = new Map();
   private traces: TraceIndex[] = [];
   private readonly choices: IterationChoices = new Map();
+  /** Open looks inside calls, under their lines. */
+  private peeks: Peek[] = [];
+  /** A peek row picked for the Inspector (until the caret moves). */
+  private peekFocus: TraceFocus | null = null;
+  private language: StreamLanguage<unknown> | null = null;
   private lines: Line[] = [];
   private references: Map<number, Reference> = new Map();
   private positions: CellPosition[] = [];
@@ -160,6 +181,7 @@ export class WorksheetView {
   }
 
   private extensions(): Extension[] {
+    this.language = hlslLanguage(this.hooks.intrinsics);
     return [
       lineNumbers(),
       highlightActiveLineGutter(),
@@ -172,12 +194,14 @@ export class WorksheetView {
       highlightSelectionMatches(),
       EditorState.tabSize.of(4),
       indentUnit.of("    "),
-      hlslLanguage(this.hooks.intrinsics),
+      this.language,
       syntaxHighlighting(hlslHighlight),
+      peekField,
       autocompletion({ override: [(context: CompletionContext) => this.complete(context)], activateOnTyping: true }),
       keymap.of([
         { key: "Alt-ArrowLeft", run: () => this.stepAtCaret(-1) },
         { key: "Alt-ArrowRight", run: () => this.stepAtCaret(1) },
+        { key: "F11", run: () => this.togglePeek(this.caretLine()) },
         ...closeBracketsKeymap,
         ...defaultKeymap,
         ...historyKeymap,
@@ -286,8 +310,9 @@ export class WorksheetView {
       }
     }
     this.lineCells = cells;
-    this.traces = lines.flatMap((line: Line) => (line.trace !== null && line.trace.points.length > 0 ? [new TraceIndex(line, line.trace)] : []));
+    this.traces = lines.flatMap((line: Line) => (line.trace !== null ? [new TraceIndex(line.trace, `${line.document}:${line.firstLine}`, line)] : []));
     this.buildTraceCells();
+    this.refreshPeeks(true);
 
     const length: number = this.view.state.doc.length;
     const marks: LintDiagnostic[] = diagnostics
@@ -334,73 +359,103 @@ export class WorksheetView {
   private markFor(cell: Cell): { mark: string; kind: string } {
     const reference: Reference | undefined = cell.line === null ? undefined : this.references.get(cell.line.index);
     if (cell.trace !== undefined) {
-      // A loop's stepper carries the whole line's verdict; a value its own iteration's
-      if (cell.trace.loop !== null) {
-        return markOf(cell.problem, reference, true);
+      // Statements: the worst of their entries' verdicts; a loop alone: the whole line's
+      if (cell.trace.points.length === 0) {
+        return cell.trace.loop === null ? { mark: "", kind: "dim" } : markOf(cell.problem, reference, true);
       }
-      const verdict: Verdict | undefined = cell.trace.entry === null ? undefined : reference?.trace[cell.trace.entry]?.verdict;
-      return markOf(cell.problem, verdict === undefined ? undefined : { verdict }, cell.trace.entry !== null);
+      const verdict: Verdict | undefined = worstVerdict(
+        cell.trace.entries.map((entry: number | null) => (entry === null ? undefined : reference?.trace[entry]?.verdict)),
+      );
+      return markOf(cell.problem, verdict === undefined ? undefined : { verdict }, cell.trace.entries.some((entry: number | null) => entry !== null));
     }
     return markOf(cell.problem, reference, cell.line?.value != null);
   }
 
-  // ---- Traces (values inside a line's loops, ifs and blocks) ----
+  // ---- Traces (values inside a line's loops, ifs and blocks; calls to look inside) ----
 
-  /** The line cells plus each traced statement's value at the chosen iterations, and each loop's stepper. */
+  /** The line cells plus, per traced line, its statements' values at the chosen iterations and its loops' steppers. */
   private buildTraceCells(): void {
     const cells: Map<number, Cell> = new Map(this.lineCells);
     for (const index of this.traces) {
-      index.trace.points.forEach((point: TracePoint, id: number) => {
-        const cell: Cell = this.traceCell(index, point, id);
-        const number: number = point.kind === "loop" ? point.firstLine : point.lastLine;
+      const numbers: Set<number> = new Set();
+      index.trace.points.forEach((point: TracePoint) => numbers.add(point.kind === "loop" ? point.firstLine : point.lastLine));
+      index.trace.calls.forEach((site) => numbers.add(site.lastLine));
+      for (const number of numbers) {
         const existing: Cell | undefined = cells.get(number);
-        if (existing === undefined || existing.isProblemText) {
-          cells.set(number, cell);
-        } else if (cell.trace?.loop !== null && existing.trace?.loop === null) {
-          // `for (...) x += i;` on one line: the stepper, then the value
-          cells.set(number, { ...cell, text: `${cell.text}  ·  ${existing.text}` });
-        } else {
-          existing.text += `  ·  ${cell.text}`;
+        const cell: Cell = this.traceCell(index, number);
+        if (existing?.isProblemText) {
+          continue;
         }
-      });
+        if (existing !== undefined && cell.trace!.points.length === 0 && cell.trace!.loop === null) {
+          // Only calls on a line that shows its own value: keep it, with the peek toggle
+          existing.hasCalls = true;
+          continue;
+        }
+        // `a = b = 3`: the line's statements replace its single value
+        cells.set(number, cell);
+      }
     }
     this.cells = cells;
   }
 
-  private traceCell(index: TraceIndex, point: TracePoint, id: number): Cell {
-    const entry: number | null = index.entryAt(id, this.choices);
-    const path: number[] | null = index.path(id, this.choices);
-    const truncated: string = index.trace.isTruncated ? "\n(only the first values the loops computed are kept)" : "";
-    if (point.kind === "loop") {
+  /** A traced line's cell: its loop's stepper, its statements' values, its calls' toggle. */
+  private traceCell(index: TraceIndex, number: number): Cell {
+    const loopIndex: number = index.trace.points.findIndex((point: TracePoint) => point.kind === "loop" && point.firstLine === number);
+    const loop: number | null = loopIndex < 0 ? null : loopIndex;
+    const points: number[] = index.valuePointsEndingOn(number);
+    const entries: (number | null)[] = points.map((point: number) => index.entryAt(point, this.choices));
+    const texts: string[] = [];
+    const details: string[] = [];
+    let isDim: boolean = false;
+    if (loop !== null) {
+      const path: number[] | null = index.path(loop, this.choices);
       if (path === null) {
-        return { text: "no iteration", isProblemText: false, problem: null, details: `The loop didn't run${truncated}`, line: index.line, trace: { index, entry, loop: id }, isDim: true };
+        texts.push("no iteration");
+        details.push("The loop didn't run");
+        isDim = points.length === 0;
+      } else {
+        const entry: number | null = index.entryAtPath(loop, path);
+        const own: string = entry === null ? "" : index.parts(entry).map((part) => `${part.name} = ${part.value.text}`).join(", ");
+        const count: number = index.iterationCount(loop, path.slice(0, -1));
+        const all: string = index.loopVariables(index.loopsOf(loop), path);
+        texts.push(`${own}${own ? " · " : ""}${path[path.length - 1] + 1}/${count}`);
+        details.push(`Iteration ${path[path.length - 1] + 1} of ${count}${all ? `: ${all}` : ""}\n◀ ▶, or Alt+← / Alt+→ with the caret in the loop, pick another`);
       }
-      const count: number = index.iterationCount(id, path.slice(0, -1));
-      const own: string =
-        entry === null ? "" : point.variables.map((name: string, at: number) => `${name} = ${index.trace.entries[entry].values[at]?.text ?? "?"}`).join(", ");
-      const all: string = index.loopVariables([...point.loops, id], path);
-      return {
-        text: `${own}${own ? " · " : ""}${path[path.length - 1] + 1}/${count}`,
-        isProblemText: false,
-        problem: null,
-        details: `Iteration ${path[path.length - 1] + 1} of ${count}${all ? `: ${all}` : ""}\n◀ ▶, or Alt+← / Alt+→ with the caret in the loop, pick another${truncated}`,
-        line: index.line,
-        trace: { index, entry, loop: id },
-      };
     }
-    if (entry === null) {
-      const where: string = path === null ? "" : ` (${index.loopVariables(point.loops, path)})`;
-      return { text: "–", isProblemText: false, problem: null, details: `Not run in this iteration${where}${truncated}`, line: index.line, trace: { index, entry, loop: null }, isDim: true };
+    if (points.length > 0) {
+      texts.push(index.describe(points, entries));
+      const path: number[] | null = index.path(points[0], this.choices);
+      if (entries.every((entry: number | null) => entry === null)) {
+        isDim = loop === null;
+        details.push("Not run in this iteration");
+      } else if (path !== null && path.length > 0) {
+        details.push(index.loopVariables(index.trace.points[points[0]].loops, path));
+      }
     }
-    const value: string = index.trace.entries[entry].values[0]?.text ?? "";
-    const where: string = path === null || path.length === 0 ? "" : `\n${index.loopVariables(point.loops, path)}`;
-    return { text: value, isProblemText: false, problem: null, details: `${value}${where}${truncated}`, line: index.line, trace: { index, entry, loop: null } };
+    const hasCalls: boolean = index.callSitesEndingOn(number).length > 0;
+    if (hasCalls) {
+      details.push("⤵ or F11: look inside the call");
+    }
+    if (index.trace.isTruncated) {
+      details.push("(only the first values the loops computed are kept)");
+    }
+    return {
+      text: texts.join("  ·  "),
+      isProblemText: false,
+      problem: null,
+      details: details.join("\n") || null,
+      line: index.line,
+      trace: { index, points, entries, loop },
+      hasCalls,
+      isDim,
+    };
   }
 
-  /** After the chosen iterations changed: the cells and the Inspector follow. */
+  /** After the chosen iterations changed: the cells, the peeks and the Inspector follow. */
   private refreshTrace(): void {
     this.buildTraceCells();
     this.scheduleLayout();
+    this.refreshPeeks(false);
     this.hooks.onSelect(this);
   }
 
@@ -426,35 +481,158 @@ export class WorksheetView {
     }
   }
 
-  /** The traced statement on the caret's line, else the innermost loop around it. */
+  /** The Inspector's subject in traced code: a peek row picked, else the statements of the caret's line, else the loop around it. */
   traceFocus(): TraceFocus | null {
+    if (this.peekFocus !== null) {
+      return this.peekFocus;
+    }
     const lineNumber: number = this.caretLine();
     for (const index of this.traces) {
-      if (lineNumber < index.line.firstLine || lineNumber > index.line.line) {
+      const line: Line = index.line!;
+      if (lineNumber < line.firstLine || lineNumber > line.line) {
         continue;
       }
-      let point: number = index.trace.points.findIndex(
-        (candidate: TracePoint) => candidate.kind === "value" && candidate.firstLine <= lineNumber && lineNumber <= candidate.lastLine,
-      );
-      if (point < 0) {
-        point = index.loopAt(lineNumber) ?? -1;
-      }
-      if (point < 0) {
-        return null;
-      }
-      const target: TracePoint = index.trace.points[point];
+      const reference: Reference | undefined = this.references.get(line.index);
+      const choose = (entry: number): void => {
+        index.choose(entry, this.choices);
+        this.refreshTrace();
+      };
       const doc = this.view.state.doc;
-      const last: number = Math.min(target.kind === "loop" ? target.firstLine : target.lastLine, doc.lines);
-      const source: string = doc.sliceString(doc.line(Math.min(target.firstLine, doc.lines)).from, doc.line(last).to);
-      return { index, point, entry: index.entryAt(point, this.choices), source };
+      const source = (first: number, last: number): string =>
+        doc.sliceString(doc.line(Math.min(first, doc.lines)).from, doc.line(Math.min(last, doc.lines)).to);
+      const points: number[] = index.valuePointsAround(lineNumber);
+      if (points.length > 0) {
+        const first: number = Math.min(...points.map((point: number) => index.trace.points[point].firstLine));
+        const last: number = index.trace.points[points[0]].lastLine;
+        const entries: (number | null)[] = points.map((point: number) => index.entryAt(point, this.choices));
+        return { index, points, isLoop: false, entries, source: source(first, last), reference, choose };
+      }
+      const loop: number | null = index.loopAt(lineNumber);
+      if (loop !== null) {
+        const header: number = index.trace.points[loop].firstLine;
+        return { index, points: [loop], isLoop: true, entries: [index.entryAt(loop, this.choices)], source: source(header, header), reference, choose };
+      }
+      return null;
     }
     return null;
   }
 
-  /** The Inspector picked an entry: show its iterations everywhere. */
-  chooseEntry(index: TraceIndex, entry: number): void {
-    index.choose(entry, this.choices);
-    this.refreshTrace();
+  // ---- Peeks (a look inside a call, under its line) ----
+
+  /** The trace of the line a call line belongs to, when it calls a worksheet function there. */
+  private traceWithCallsOn(lineNumber: number): TraceIndex | null {
+    return (
+      this.traces.find(
+        (index: TraceIndex) => index.line !== null && index.line.firstLine <= lineNumber && lineNumber <= index.line.line && index.callSitesEndingOn(lineNumber).length > 0,
+      ) ?? null
+    );
+  }
+
+  private sitesOn(lineNumber: number): PeekSite[] {
+    const index: TraceIndex | null = this.traceWithCallsOn(lineNumber);
+    return index === null ? [] : index.callSitesEndingOn(lineNumber).map((site: number) => ({ site, name: index.trace.calls[site].function }));
+  }
+
+  /** F11 or ⤵: opens (or closes) a look inside the calls of a line. */
+  togglePeek(lineNumber: number): boolean {
+    const existing: Peek | undefined = this.peeks.find((peek: Peek) => peek.lineNumber === lineNumber);
+    if (existing !== undefined) {
+      this.closePeek(existing);
+      return true;
+    }
+    const sites: PeekSite[] = this.sitesOn(lineNumber);
+    if (sites.length === 0) {
+      return false;
+    }
+    let peek: Peek | null = null;
+    const line = (): Line | null => (peek === null ? null : (this.traceWithCallsOn(peek.lineNumber)?.line ?? null));
+    const hooks: PeekHooks = {
+      traceCall: (path: CallPath) => {
+        const owner: Line | null = line();
+        return owner === null ? Promise.resolve(null) : this.hooks.traceCall(owner, path);
+      },
+      checkCall: (path: CallPath) => {
+        const owner: Line | null = line();
+        return owner === null ? Promise.resolve(null) : this.hooks.checkCall(owner, path);
+      },
+      documentText: (name: string) => (name === this.name ? this.text : this.hooks.documentText(name)),
+      language: this.language!,
+      focus: (focus: TraceFocus) => {
+        this.peekFocus = focus;
+        this.hooks.onSelect(this);
+      },
+      resized: () => {
+        this.view.requestMeasure();
+        this.scheduleLayout();
+      },
+    };
+    peek = new Peek(
+      hooks,
+      [],
+      lineNumber,
+      sites,
+      (site: number) => (peek === null ? null : (this.traceWithCallsOn(peek.lineNumber)?.occurrence(site, this.choices) ?? null)),
+      () => this.closePeek(peek!),
+    );
+    this.peeks.push(peek);
+    this.syncPeeks();
+    this.buildTraceCells();
+    this.scheduleLayout();
+    void peek.refresh(null, true);
+    return true;
+  }
+
+  private closePeek(peek: Peek): void {
+    this.peeks = this.peeks.filter((candidate: Peek) => candidate !== peek);
+    if (this.peekFocus !== null) {
+      this.peekFocus = null;
+      this.hooks.onSelect(this);
+    }
+    this.syncPeeks();
+    this.scheduleLayout();
+  }
+
+  /** The peeks as block widgets under their lines. */
+  private syncPeeks(): void {
+    const doc = this.view.state.doc;
+    const ranges: Range<Decoration>[] = this.peeks
+      .filter((peek: Peek) => peek.lineNumber <= doc.lines)
+      .sort((left: Peek, right: Peek) => left.lineNumber - right.lineNumber)
+      .map((peek: Peek) => Decoration.widget({ widget: new PeekWidget(peek), block: true, side: 1 }).range(doc.line(peek.lineNumber).to));
+    this.view.dispatch({ effects: setPeeks.of(Decoration.set(ranges)) });
+  }
+
+  /** A new evaluation (`isForced`), or other iterations chosen: each peek follows its call, or closes when the line no longer calls. */
+  private refreshPeeks(isForced: boolean): void {
+    let isClosing: boolean = false;
+    for (const peek of [...this.peeks]) {
+      const sites: PeekSite[] = this.sitesOn(peek.lineNumber);
+      if (sites.length === 0) {
+        this.peeks = this.peeks.filter((candidate: Peek) => candidate !== peek);
+        isClosing = true;
+        continue;
+      }
+      void peek.refresh(sites, isForced);
+    }
+    if (isClosing) {
+      this.syncPeeks();
+    }
+  }
+
+  /** After an edit: the lines the peeks hang under, as the widgets moved. */
+  private followPeekLines(): void {
+    const doc = this.view.state.doc;
+    this.view.state.field(peekField).between(0, doc.length, (from: number, _to: number, decoration: Decoration) => {
+      const widget: PeekWidget | undefined = decoration.spec.widget as PeekWidget | undefined;
+      if (widget !== undefined) {
+        widget.peek.lineNumber = doc.lineAt(from).number;
+      }
+    });
+  }
+
+  /** "lighting.hlsl:5 D_GGX(…) → …" for every open peek (tests read it). */
+  peeksText(): string[] {
+    return this.peeks.map((peek: Peek) => peek.element.innerText);
   }
 
   private caretLine(): number {
@@ -485,8 +663,16 @@ export class WorksheetView {
     if (update.docChanged && !this.isReplacingText) {
       this.hooks.onEdit(this);
     }
+    if (update.docChanged) {
+      this.followPeekLines();
+    }
+    // The caret moved: the Inspector leaves the peek row it showed
+    const leavesPeek: boolean = update.selectionSet && this.peekFocus !== null;
+    if (leavesPeek) {
+      this.peekFocus = null;
+    }
     if (update.selectionSet || update.docChanged) {
-      this.selectLine(this.caretLine());
+      this.selectLine(this.caretLine(), leavesPeek);
     }
     if (update.docChanged || update.viewportChanged || update.geometryChanged || update.heightChanged) {
       this.scheduleLayout();
@@ -562,6 +748,14 @@ export class WorksheetView {
         } else {
           row.append(markElement, textElement);
         }
+        if (cell.hasCalls) {
+          const isOpen: boolean = this.peeks.some((peek: Peek) => peek.lineNumber === position.number);
+          const toggle: HTMLElement = document.createElement("span");
+          toggle.className = "peek-toggle";
+          toggle.textContent = isOpen ? "⤴" : "⤵";
+          toggle.title = isOpen ? "Close the look inside (F11)" : "Look inside the call (F11)";
+          row.append(toggle);
+        }
         row.title = this.describe(cell);
         row.dataset.line = String(position.number);
       }
@@ -588,6 +782,13 @@ export class WorksheetView {
     if (step !== null && stepRow?.dataset.line !== undefined) {
       event.preventDefault();
       this.stepLoopAtLine(Number(stepRow.dataset.line), Number(step.dataset.step));
+      return;
+    }
+    const toggleRow: HTMLElement | null | undefined = (event.target as HTMLElement).closest(".peek-toggle")?.closest<HTMLElement>(".result-row");
+    if (toggleRow?.dataset.line !== undefined) {
+      event.preventDefault();
+      this.togglePeek(Number(toggleRow.dataset.line));
+      this.scheduleLayout();
       return;
     }
     const top: number = this.results.getBoundingClientRect().top;

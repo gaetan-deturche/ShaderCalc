@@ -549,6 +549,144 @@ table.components tr.dim td {
   color: var(--dim);
 }
 
+/* A look inside a call, under its line */
+.result-row .peek-toggle {
+  flex: none;
+  padding: 0 5px;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.peek {
+  margin: 2px 0 6px 18px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  background: var(--surface);
+  font-family: var(--mono);
+  font-size: 13px;
+  white-space: pre;
+  cursor: default;
+}
+
+.peek .peek {
+  margin-left: 26px;
+}
+
+.peek-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--dim);
+  font-family: var(--ui);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.peek-title {
+  color: var(--text);
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.peek .value {
+  color: var(--result);
+}
+
+.peek-where {
+  margin-left: auto;
+}
+
+.peek-close,
+.peek-site {
+  cursor: pointer;
+}
+
+.peek-close:hover,
+.peek-site:hover {
+  color: var(--text);
+}
+
+.peek-site.active {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.peek-body {
+  padding: 2px 0;
+}
+
+.peek-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 0 8px 0 0;
+}
+
+.peek-row[data-focus="1"] {
+  cursor: pointer;
+}
+
+.peek-row:hover {
+  background: var(--active-line);
+}
+
+.peek-number {
+  flex: none;
+  width: 4ch;
+  text-align: right;
+  color: var(--line-numbers);
+}
+
+.peek-code {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--editor-fg);
+}
+
+.peek-row .mark {
+  flex: none;
+  width: 14px;
+}
+
+.peek-result {
+  flex: 0 1 45%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: left;
+}
+
+.peek-result .step,
+.peek-result .peek-toggle {
+  padding: 0 4px;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.peek-message {
+  padding: 4px 10px;
+  color: var(--dim);
+  font-family: var(--ui);
+}
+
+/* Traced variables in the Inspector, one under the other */
+.trace-variable {
+  margin: 6px 0 10px;
+}
+
+.trace-variable-name {
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--text);
+}
+
 /* Every iteration of a traced statement */
 table.iterations {
   width: 100%;

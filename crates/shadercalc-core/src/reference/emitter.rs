@@ -20,13 +20,16 @@ pub struct Harness {
     pub trace: Option<HarnessTrace>,
 }
 
-/// A traced line: its trace points by statement node, and where the shader writes their values (in execution
-/// order from output word `base`, `capacity` words at most: what the interpreter recorded; `refTraceCursor` counts).
+/// Traced code (a line, or a call's body): its trace points by statement node, and where the shader writes their
+/// values (in execution order from output word `base`, `capacity` words at most: what the interpreter recorded;
+/// `refTraceCursor` counts). Stores are emitted while `is_active`, and only run when `guard` (an HLSL bool) holds.
 pub struct HarnessTrace {
     pub ids: HashMap<*const BoundStatement, usize>,
     pub points: Vec<TracePoint>,
     pub base: usize,
     pub capacity: usize,
+    pub is_active: bool,
+    pub guard: Option<String>,
 }
 
 /// HLSL storing one component in the output buffer at `index` (an HLSL expression), and the words it takes.
@@ -56,6 +59,8 @@ pub struct HlslEmitter {
     pub harness: Option<Harness>,
     /// Set when the tree holds something that can't be written as HLSL (an expression with errors).
     pub failure: Option<String>,
+    /// Calls emitted to another function (by node): its name and one more argument (a traced copy and its switch).
+    pub redirects: HashMap<*const BoundExpression, (String, String)>,
 }
 
 /// `float3 name`, `float name[2][3]`.
@@ -115,7 +120,7 @@ fn float_literal(value: f32) -> String {
 
 impl HlslEmitter {
     pub fn new() -> HlslEmitter {
-        HlslEmitter { text: String::new(), harness: None, failure: None }
+        HlslEmitter { text: String::new(), harness: None, failure: None, redirects: HashMap::new() }
     }
 
     pub fn with_harness() -> HlslEmitter {
@@ -123,6 +128,7 @@ impl HlslEmitter {
             text: String::new(),
             harness: Some(Harness { is_emitting_line: false, inputs: Vec::new(), trace: None }),
             failure: None,
+            redirects: HashMap::new(),
         }
     }
 
@@ -176,6 +182,21 @@ impl HlslEmitter {
             self.emit_statement(&body, 0);
             self.text.push('\n');
         }
+    }
+
+    /// A copy of a function under another name, with one more parameter, no default values.
+    pub fn emit_copy(&mut self, function: &FunctionRef, name: &str, extra_parameter: &str) {
+        let Some(body) = function.body() else {
+            return;
+        };
+        let signature: String = self.signature(function, false);
+        let open: usize = signature.find('(').expect("a parameter list");
+        let close: usize = signature.rfind(')').expect("a parameter list");
+        let parameters: &str = &signature[open + 1..close];
+        let separator: &str = if parameters.is_empty() { "" } else { ", " };
+        self.text.push_str(&format!("{} {name}({parameters}{separator}{extra_parameter})\n", function.return_type));
+        self.emit_statement(&body, 0);
+        self.text.push('\n');
     }
 
     fn signature(&mut self, function: &FunctionRef, with_defaults: bool) -> String {
@@ -257,6 +278,14 @@ impl HlslEmitter {
                 }
                 self.text.push_str(&format!("{indent}}}\n"));
             }
+            BoundStatementKind::Return(Some(value)) if self.trace_point(statement).is_some() => {
+                let text: String = self.expression(value);
+                let store: String = self.trace_store(&[("refTraceValue".to_string(), value.ty.clone())], depth + 1);
+                let returned: String = declaration(&value.ty, "refTraceValue");
+                self.text.push_str(&format!(
+                    "{indent}{{\n{indent}    {returned} = {text};\n{store}{indent}    return refTraceValue;\n{indent}}}\n"
+                ));
+            }
             BoundStatementKind::Return(value) => {
                 let text: String = match value {
                     None => "return;\n".to_string(),
@@ -287,16 +316,34 @@ impl HlslEmitter {
             }
             BoundStatementKind::Expression(expression) => {
                 let text: String = self.expression(expression);
-                if self.trace_point(statement).is_some() {
+                let kind: Option<TracePointKind> =
+                    self.trace_point(statement).map(|point| self.trace().points[point].kind.clone());
+                if let Some(TracePointKind::Value { .. }) = kind {
                     let store: String =
                         self.trace_store(&[("refTraceValue".to_string(), expression.ty.clone())], depth + 1);
                     let value: String = declaration(&expression.ty, "refTraceValue");
                     self.text.push_str(&format!("{indent}{{\n{indent}    {value} = {text};\n{store}{indent}}}\n"));
                 } else {
                     self.text.push_str(&format!("{indent}{text};\n"));
+                    self.emit_trace_after(statement, depth);
                 }
             }
         }
+    }
+
+    /// After a traced statement that writes variables: their values, as its trace entry.
+    pub fn emit_trace_after(&mut self, statement: &BoundStatement, depth: usize) {
+        let Some(point) = self.trace_point(statement) else {
+            return;
+        };
+        let variables: Vec<(String, ShaderType)> = match &self.trace().points[point].kind {
+            TracePointKind::Writes { variables } => {
+                variables.iter().map(|variable| (variable.name.clone(), variable.ty.clone())).collect()
+            }
+            _ => return,
+        };
+        let store: String = self.trace_store(&variables, depth);
+        self.text.push_str(&store);
     }
 
     /// A loop's body; in a traced line, after writing the loop's variables (each iteration's entry).
@@ -306,12 +353,12 @@ impl HlslEmitter {
             return;
         };
         let indent: String = " ".repeat(depth * 4);
-        let variables: Vec<(String, ShaderType)> = match &self.trace().points[point].kind {
-            TracePointKind::Loop { variables } => {
-                variables.iter().map(|variable| (variable.name.clone(), variable.ty.clone())).collect()
-            }
-            TracePointKind::Value { .. } => Vec::new(),
-        };
+        let variables: Vec<(String, ShaderType)> = self.trace().points[point]
+            .kind
+            .variables()
+            .iter()
+            .map(|variable| (variable.name.clone(), variable.ty.clone()))
+            .collect();
         let store: String = self.trace_store(&variables, depth + 1);
         self.text.push_str(&format!("{indent}{{\n{store}"));
         self.emit_statement(body, depth + 1);
@@ -322,10 +369,10 @@ impl HlslEmitter {
         self.harness.as_ref().and_then(|harness| harness.trace.as_ref()).expect("a traced line")
     }
 
-    /// The trace point of one of the line's statements, while emitting a traced line.
+    /// The trace point of a statement of the traced code, while emitting it.
     fn trace_point(&self, statement: &BoundStatement) -> Option<usize> {
-        let harness: &Harness = self.harness.as_ref().filter(|harness| harness.is_emitting_line)?;
-        harness.trace.as_ref()?.ids.get(&(statement as *const BoundStatement)).copied()
+        let trace: &HarnessTrace = self.harness.as_ref()?.trace.as_ref().filter(|trace| trace.is_active)?;
+        trace.ids.get(&(statement as *const BoundStatement)).copied()
     }
 
     /// Writes values (variables, by name) as the next trace entry when it fits, and counts its words regardless.
@@ -342,14 +389,26 @@ impl HlslEmitter {
                 words += count;
             }
         }
-        format!(
+        let store: String = format!(
             "{indent}if (refTraceCursor + {words}u <= {}u)\n{indent}{{\n{stores}{indent}}}\n{indent}refTraceCursor += {words}u;\n",
             trace.capacity
-        )
+        );
+        match &trace.guard {
+            Some(guard) => format!("{indent}if ({guard})\n{indent}{{\n{store}{indent}}}\n"),
+            None => store,
+        }
     }
 
     fn emit_nested(&mut self, statement: &BoundStatement, depth: usize) {
         let is_block: bool = matches!(statement.kind, BoundStatementKind::Block { .. });
+        if !is_block && self.trace_point(statement).is_some() {
+            // A traced statement writes its values after itself: braces keep them in the if's body
+            let indent: String = " ".repeat(depth * 4);
+            self.text.push_str(&format!("{indent}{{\n"));
+            self.emit_statement(statement, depth + 1);
+            self.text.push_str(&format!("{indent}}}\n"));
+            return;
+        }
         self.emit_statement(statement, if is_block { depth } else { depth + 1 });
     }
 
@@ -489,6 +548,13 @@ impl HlslEmitter {
                 format!("({condition} ? {when_true} : {when_false})")
             }
             // Default arguments are filled in by the binder; DXC fills them in itself
+            Call { arguments, .. } if self.redirects.contains_key(&(expression as *const BoundExpression)) => {
+                // Every argument, defaults included: the extra one comes after them
+                let mut texts: Vec<String> = arguments.iter().map(|argument| self.expression(argument)).collect();
+                let (name, extra) = self.redirects[&(expression as *const BoundExpression)].clone();
+                texts.push(extra);
+                format!("{name}({})", texts.join(", "))
+            }
             Call { function, arguments, explicit_count } => {
                 let texts: Vec<String> =
                     arguments[..*explicit_count].iter().map(|argument| self.expression(argument)).collect();

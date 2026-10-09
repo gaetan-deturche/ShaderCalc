@@ -3,7 +3,7 @@ use shadercalc_core::diagnostics::{Diagnostic, DiagnosticSeverity};
 use shadercalc_core::docs::DocEntry;
 use shadercalc_core::exports::Export;
 use shadercalc_core::reference::checker::{ReferenceOutcome, ReferenceVerdict};
-use shadercalc_core::trace::{LineTrace, TracePointKind};
+use shadercalc_core::trace::{CallTrace, LineTrace, TracePointKind};
 use shadercalc_core::types::{ScalarKind, ShaderType};
 use shadercalc_core::units::Dimension;
 use shadercalc_core::values::{Value, describe_dimension, format_component};
@@ -251,7 +251,8 @@ pub struct LineDto {
     pub trace: Option<TraceDto>,
 }
 
-/// A statement of a line's loops/ifs/blocks (`kind` "value") or a loop ("loop", with its variables' names).
+/// A statement of a line's loops/ifs/blocks (`kind` "value": the variables it writes, or its value when they're
+/// none), or a loop ("loop": its variables).
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TracePointDto {
@@ -277,6 +278,54 @@ pub struct TraceDto {
     pub points: Vec<TracePointDto>,
     pub entries: Vec<TraceEntryDto>,
     pub is_truncated: bool,
+    pub calls: Vec<CallSiteDto>,
+    pub call_entries: Vec<CallEntryDto>,
+}
+
+/// A call to a worksheet function in the traced code.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallSiteDto {
+    pub function: String,
+    pub first_line: usize,
+    pub last_line: usize,
+}
+
+/// A run of a call site, in its enclosing loops' iterations.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallEntryDto {
+    pub site: usize,
+    pub iterations: Vec<u32>,
+}
+
+/// One call's look inside: the function (its document and lines), its parameters, result and body trace.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallTraceDto {
+    pub function: String,
+    pub document: String,
+    pub first_line: usize,
+    pub last_line: usize,
+    pub parameters: Vec<String>,
+    pub arguments: Vec<ValueDto>,
+    pub result: Option<ValueDto>,
+    pub trace: TraceDto,
+}
+
+impl From<&CallTrace> for CallTraceDto {
+    fn from(call: &CallTrace) -> CallTraceDto {
+        CallTraceDto {
+            function: call.function.name.clone(),
+            document: call.function.source_name(),
+            first_line: call.first_line,
+            last_line: call.last_line,
+            parameters: call.function.parameters.iter().map(|parameter| parameter.name.clone()).collect(),
+            arguments: call.arguments.iter().map(ValueDto::from).collect(),
+            result: call.result.as_ref().map(ValueDto::from),
+            trace: TraceDto::from(&call.trace),
+        }
+    }
 }
 
 impl From<&LineTrace> for TraceDto {
@@ -286,18 +335,16 @@ impl From<&LineTrace> for TraceDto {
                 .points
                 .iter()
                 .map(|point| {
-                    let (kind, variables) = match &point.kind {
-                        TracePointKind::Value { .. } => ("value", Vec::new()),
-                        TracePointKind::Loop { variables } => {
-                            ("loop", variables.iter().map(|variable| variable.name.clone()).collect())
-                        }
+                    let kind: &'static str = match &point.kind {
+                        TracePointKind::Writes { .. } | TracePointKind::Value { .. } => "value",
+                        TracePointKind::Loop { .. } => "loop",
                     };
                     TracePointDto {
                         kind,
                         first_line: point.first_line,
                         last_line: point.last_line,
                         loops: point.loops.clone(),
-                        variables,
+                        variables: point.kind.variables().iter().map(|variable| variable.name.clone()).collect(),
                     }
                 })
                 .collect(),
@@ -311,6 +358,20 @@ impl From<&LineTrace> for TraceDto {
                 })
                 .collect(),
             is_truncated: trace.is_truncated,
+            calls: trace
+                .calls
+                .iter()
+                .map(|site| CallSiteDto {
+                    function: site.function.name.clone(),
+                    first_line: site.first_line,
+                    last_line: site.last_line,
+                })
+                .collect(),
+            call_entries: trace
+                .call_entries
+                .iter()
+                .map(|entry| CallEntryDto { site: entry.site, iterations: entry.iterations.clone() })
+                .collect(),
         }
     }
 }

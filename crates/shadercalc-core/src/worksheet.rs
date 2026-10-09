@@ -14,7 +14,7 @@ use crate::syntax::lexer::{Token, tokenize};
 use crate::syntax::parser::parse_worksheet;
 use crate::syntax::preprocessor::{MacroDefinition, Preprocessor};
 use crate::syntax::tree::{DeclarationSyntax, ExpressionKind, ItemSyntax, StatementKind};
-use crate::trace::LineTrace;
+use crate::trace::{CallTrace, LineTrace};
 use crate::units::UNITS;
 use crate::values::Value;
 
@@ -174,18 +174,10 @@ pub fn evaluate(
             result_variable: shown_variable,
             declared_variables: line.declared.clone(),
         };
-        let last_line_of = |span: SourceSpan| -> usize {
-            match line_starts.get(line.source.as_str()) {
-                Some(starts) => line_of(starts, span.end().saturating_sub(1).max(span.offset)),
-                None => span.line,
-            }
-        };
-        let last_line: usize = last_line_of(line.span);
+        let starts: Option<&Vec<usize>> = line_starts.get(line.source.as_str());
+        let last_line: usize = last_line_of(line.span, starts);
         if let Some(trace) = trace.as_mut() {
-            for point in &mut trace.points {
-                point.first_line = point.span.line;
-                point.last_line = last_line_of(point.span);
-            }
+            fill_trace_lines(trace, starts);
         }
         let result: LineResult = LineResult {
             value,
@@ -305,6 +297,66 @@ pub(crate) fn declared_names(items: &[ItemSyntax]) -> Vec<String> {
         }
     }
     names
+}
+
+/// The 1-based line a span ends on (its own line without the document's line starts).
+fn last_line_of(span: SourceSpan, starts: Option<&Vec<usize>>) -> usize {
+    match starts {
+        Some(starts) => line_of(starts, span.end().saturating_sub(1).max(span.offset)),
+        None => span.line,
+    }
+}
+
+/// The lines of a trace's points and call sites, from their spans in their document.
+fn fill_trace_lines(trace: &mut LineTrace, starts: Option<&Vec<usize>>) {
+    for point in &mut trace.points {
+        point.first_line = point.span.line;
+        point.last_line = last_line_of(point.span, starts);
+    }
+    for site in &mut trace.calls {
+        site.first_line = site.span.line;
+        site.last_line = last_line_of(site.span, starts);
+    }
+}
+
+/// Re-runs a line from the values it started with, to trace one call it makes: `path` leads to it (a call site of
+/// the line, numbered like `trace::call_sites`, and which of its runs; then one in that function's body; ...).
+pub fn trace_call(
+    line: &WorksheetLine,
+    documents: &[WorksheetDocument],
+    path: &[(usize, usize)],
+    profile: &SemanticsProfile,
+    options: &EvaluationOptions,
+) -> Result<CallTrace, String> {
+    let (Some(bound), Some(program)) = (&line.result.line, &line.result.program) else {
+        return Err("the line didn't run".to_string());
+    };
+    let [statement] = bound.statements.as_slice() else {
+        return Err("the line has several statements".to_string());
+    };
+    let mut storage: Storage = Storage::new();
+    let mut diagnostics: DiagnosticBag = DiagnosticBag::new();
+    {
+        let mut evaluator: Evaluator = Evaluator::new(profile, options, &mut storage, &mut diagnostics, "");
+        evaluator.zero_globals(program);
+    }
+    storage.extend(line.result.inputs.iter().map(|(variable, value)| (variable.clone(), value.clone())));
+    let mut call: CallTrace = {
+        let mut evaluator: Evaluator = Evaluator::new(profile, options, &mut storage, &mut diagnostics, &line.document);
+        evaluator.set_current_source(&line.document);
+        evaluator.follow_call(statement, path.to_vec());
+        // What the line does after the call doesn't matter
+        let _ = evaluator.run(bound);
+        evaluator.take_call_trace().ok_or("that call didn't run")?
+    };
+    let source: String = call.function.source_name();
+    let starts: Option<Vec<usize>> =
+        documents.iter().find(|document| document.name == source).map(|document| line_starts(&document.text));
+    let span: SourceSpan = call.function.syntax().span;
+    call.first_line = span.line;
+    call.last_line = last_line_of(span, starts.as_ref());
+    fill_trace_lines(&mut call.trace, starts.as_ref());
+    Ok(call)
 }
 
 /// UTF-16 offsets where each line starts.

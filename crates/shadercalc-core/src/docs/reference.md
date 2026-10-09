@@ -20,6 +20,10 @@ Click a result (or put the caret on its line) to see its type, every component's
 
 Inside a top-level loop, `if`, `switch` or `{ }` block, every statement shows its value too. A loop's line shows its variables and iteration (`i = 4 · 5/5`) between ◀ ▶: they, or Alt+← / Alt+→ with the caret in the loop, pick the iteration the values inside show (nested loops have one each); a statement that didn't run in that iteration shows –. With the caret on such a statement, the Inspector lists all its iterations: click one to show it everywhere. Every iteration's values are checked on DXC + WARP too. A line keeps the first 4,096 values its loops compute.
 
+A statement shows the variables it writes (declared, assigned, incremented, passed as `out`/`inout`): `a = 1, b = 2` when there are several, on a line of its own too (`float a = 1, b = 2`, `a = b = 3`). The Inspector lists them one under the other.
+
+A line that calls a worksheet function shows ⤵: click it, or press F11 with the caret on the line, to look inside the call. The function's code opens under the line with that call's values beside each line (the run in the chosen iteration of the loops around the call), its own loops' steppers, and ⤵ on the calls it makes. Those values are checked on DXC + WARP too; click a line of it to see it in the Inspector, × or F11 closes it.
+
 The Library tab (next to Docs) lists what each library declares, with the `//` comment above each declaration: functions, structs, `typedef`s, `#define`s, globals and the variables its lines create. Click one to type it into the scratch pad (a call gets its parameters as fields: Tab moves between them), Ctrl+click to open its declaration. The filter box matches names, declarations and comments; ↑↓ and Enter work from it.
 
 ## Reference check

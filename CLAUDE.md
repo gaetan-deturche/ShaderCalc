@@ -72,12 +72,18 @@ component is raw `u64` bits plus a `UnitTag`).
 - A top-level variable (declared, or `x = v` for a new name) is a global that functions can read.
 - Each line gets its own evaluator over shared storage, its own diagnostics, and a snapshot of the globals it
   starts from (`LineResult::inputs`, used by the reference). A line with bind errors isn't run.
-- Traces (`trace.rs`, `LineResult::trace`): `trace_points` numbers a line statement's nested value statements
-  (declarations, non-void non-literal expressions inside loop bodies/ifs/switches/scope blocks) and its loops in
-  pre-order, keyed by node address. The evaluator (`trace_line`) records each execution with the iteration of
-  every enclosing loop; a loop records its initializer's variables at each iteration start. The worksheet fills in
-  the points' lines. `MAX_TRACE_ENTRIES` (4,096) caps a line. The checker's emitter walks its own copy of the tree
-  with the same numbering (the interpreter's tree is a clone).
+- Traces (`trace.rs`, `LineResult::trace`): `trace_points` numbers, in pre-order and keyed by node address, a
+  line statement's nested statements (in loop bodies/ifs/switches/scope blocks: `Writes` = the variables a
+  statement writes per `written_variables`, declarations / assignment and `++` targets / out-inout arguments, whole
+  variable; `Value` for a non-void statement writing nothing and for returns), a top-level statement writing 2+
+  variables (`float a = 1, b = 2`, `a = b = 3`), and loops. The evaluator (`trace_line`) records each execution
+  with the iteration of every enclosing loop (only at the tracer's frame depth); a loop records its initializer's
+  variables at each iteration start. `call_sites` numbers calls to worksheet functions; their runs are
+  `call_entries`. The worksheet fills in the lines. `MAX_TRACE_ENTRIES` (4,096) caps a line. The checker's emitter
+  walks its own copy of the tree with the same numbering (the interpreter's tree is a clone).
+- Calls (`worksheet::trace_call`): re-runs a line from `LineResult::inputs` with `Evaluator::follow_call(path)`:
+  per level a (site, run) pair, runs counted only at the followed frame depth; the last call's body is traced
+  (`CallTrace`: arguments, result, body trace, the function's lines).
 
 ## Reference (`reference/`)
 
@@ -95,6 +101,12 @@ component is raw `u64` bits plus a `UnitTag`).
   words, then the word count the shader wrote (`refTraceCursor`), then the entries. Stores are guarded by the
   interpreter's count (`capacity`): the output is a root UAV, with no bounds check. Each entry gets its own verdict
   (`ReferenceOutcome::trace`); the line's is the worst; a different count means the loops ran differently.
+- A call (`check_call`, `build_call_harness`): every function on the path is emitted again as
+  `RefTraced<level>_<name>(..., bool refOn)` (`emit_copy`, deepest first; all arguments, defaults included); the
+  call leading to the next level is redirected to its copy (`HlslEmitter::redirects`) with `refOn && (refRun<n>++
+  == run)`, so it's on for the chosen run only; the last copy stores its trace guarded by `refOn`
+  (`HarnessTrace::guard`), cursor and run counters are static globals. Literals stay literals in the copies (DXC
+  folds them as in the real function). Output: the count, then the entries.
 - A shader that removes the WARP device (a double fma does) yields `ReferenceError::Crashed`; the dead device is
   dropped and recreated on the next run (D3D12 hands back the same device while any reference to it lives).
 - Verdicts: bit-identical `✓`; `≈` for approximate intrinsics within 64 ulp or 0.0008 absolute; `⊘` WarpLimit when
@@ -127,8 +139,14 @@ component is raw `u64` bits plus a `UnitTag`).
   a wider gap between bytes, 32 bits a row, fields coloured, bits that differ from WARP's marked. Traces: `trace.ts` (`TraceIndex`: entry by
   iteration path, iterations per loop, stepping) behind `WorksheetView`'s trace cells (each statement's value at
   the chosen iterations, a ◀ ▶ stepper per loop, Alt+←/→), `IterationChoices` keyed by document + line + point so
-  they survive re-evaluation; `traceFocus` + `buildTraceInspector` list a statement's iterations (click =
-  choose). `docs.ts`: the docs panel (`marked`). `library.ts`: the Library panel from `evaluate`'s `exports`, grouped by
+  they survive re-evaluation; a line's statements share one cell (`describe`: names when several).
+  `traceFocus` + `buildTraceInspector`: the line's variables stacked (bits each), then an iteration table whose
+  rows stack them too (click = choose). `peek.ts`: a `Peek` is a block widget (`peekField`) under a call line (⤵ in
+  the result row, F11): `traceCall` / `checkCall` with the path from the line (site, run from
+  `TraceIndex::occurrence` for the chosen iterations), the function's lines highlighted (`highlightTree` with the
+  editor's `HighlightStyle`), its values and steppers (own `IterationChoices`), nested peeks per line; a row click
+  sets `peekFocus` for the Inspector until the caret moves. Peeks follow re-evaluations and iteration changes.
+  `marks.ts`: `markOf`, `worstVerdict`. `docs.ts`: the docs panel (`marked`). `library.ts`: the Library panel from `evaluate`'s `exports`, grouped by
   library in tab order (re-rendered only when they change). Click → `WorksheetView.insertSnippet` in the scratch
   pad (a CodeMirror snippet, parameters as numbered fields; it replaces a partly typed name, stays inline in an
   expression or on a blank line, else goes on a new line); Ctrl+click → `goTo` the name's offset.

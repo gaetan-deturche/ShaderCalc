@@ -1,6 +1,6 @@
-import { TraceIndex } from "./trace";
-import { BitField, Component, Diagnostic, Line, Reference, TraceCheck, TraceEntry, TracePoint, ValueInfo, Verdict } from "./types";
-import { markOf, TraceFocus } from "./worksheet-view";
+import { markOf, worstVerdict } from "./marks";
+import { IterationRow, TraceFocus, TraceIndex } from "./trace";
+import { BitField, Component, Diagnostic, Line, Reference, TraceCheck, ValueInfo, Verdict } from "./types";
 
 function element<K extends keyof HTMLElementTagNameMap>(tag: K, className: string = "", text: string = ""): HTMLElementTagNameMap[K] {
   const node: HTMLElementTagNameMap[K] = document.createElement(tag);
@@ -56,71 +56,119 @@ function iterationLabel(iterations: number[]): string {
 }
 
 /**
- * A statement inside a traced line, or a loop: its value at the chosen iterations in detail, then every iteration's
- * in a table (a click picks those iterations everywhere), then the line's reference check.
+ * Traced code (a line's statements, or a loop): each variable at the chosen iterations in detail, one under the
+ * other, then every iteration in a table whose rows stack the variables too (a click picks those iterations
+ * everywhere), then the reference check.
  */
-export function buildTraceInspector(focus: TraceFocus, reference: Reference | undefined, onChoose: (entry: number) => void): HTMLElement {
+export function buildTraceInspector(focus: TraceFocus): HTMLElement {
   const index: TraceIndex = focus.index;
-  const target: TracePoint = index.trace.points[focus.point];
-  const loops: number[] = index.loopsOf(focus.point);
+  const loops: number[] = index.loopsOf(focus.points[0]);
   const root: HTMLElement = element("div", "inspector");
   root.append(element("pre", "code-block", focus.source.trim()));
 
-  if (focus.entry === null) {
-    root.append(element("p", "dim", target.kind === "loop" ? "The loop didn't run." : "Not run in the chosen iteration."));
+  const anchor: number | null = focus.entries.find((entry: number | null) => entry !== null) ?? null;
+  if (anchor === null) {
+    root.append(element("p", "dim", focus.isLoop ? "The loop didn't run." : "Not run in the chosen iteration."));
   } else {
-    const entry: TraceEntry = index.trace.entries[focus.entry];
-    const where: string = index.loopVariables(loops, entry.iterations);
-    root.append(element("div", "dim small", `Iteration ${iterationLabel(entry.iterations)}${where ? ` · ${where}` : ""}`));
-    if (target.kind === "value" && entry.values.length > 0) {
-      const value: ValueInfo = entry.values[0];
-      const check: TraceCheck | undefined = reference?.trace[focus.entry];
-      root.append(element("div", "inspector-value", value.text));
-      const typeLine: HTMLElement = element("div", "inspector-type");
-      typeLine.append(element("code", "", value.ty));
-      if (value.units) {
-        typeLine.append(element("span", "", `   ${value.units}`));
-      }
-      root.append(typeLine, buildComponents(value, check === undefined ? undefined : { verdict: check.verdict, referenceValue: check.values[0] ?? null }));
+    const iterations: number[] = index.trace.entries[anchor].iterations;
+    if (iterations.length > 0) {
+      root.append(element("div", "dim small", `Iteration ${iterationLabel(iterations)} · ${index.loopVariables(loops, iterations)}`));
+    }
+    if (!focus.isLoop) {
+      focus.points.forEach((point: number, at: number) => root.append(...buildPointValues(focus, point, focus.entries[at])));
     }
   }
 
-  const entries: number[] = index.entriesOf(focus.point);
-  root.append(element("h3", "", `${target.kind === "loop" ? "Iterations" : "Every iteration"} (${entries.length}${index.trace.isTruncated ? "+" : ""})`));
+  if (loops.length > 0) {
+    root.append(buildIterations(focus, loops));
+  }
+  if (index.trace.isTruncated) {
+    root.append(element("p", "dim small", "The code ran longer: only its first values are kept."));
+  }
+  root.append(element("h3", "", "Reference (DXC + WARP)"));
+  root.append(buildReference(focus.reference));
+  return root;
+}
+
+/** One statement's variables (or value), each with its type and bits, against the reference's when they differ. */
+function buildPointValues(focus: TraceFocus, point: number, entry: number | null): HTMLElement[] {
+  const index: TraceIndex = focus.index;
+  const names: string[] = index.trace.points[point].variables;
+  if (entry === null) {
+    return names.map((name: string) => element("div", "trace-variable dim", `${name}: not run in this iteration`));
+  }
+  const check: TraceCheck | undefined = focus.reference?.trace[entry];
+  const isAlone: boolean = focus.points.length === 1 && names.length <= 1;
+  return index.parts(entry).map((part, at: number) => {
+    const block: HTMLElement = element("div", "trace-variable");
+    if (!isAlone) {
+      block.append(element("div", "trace-variable-name", part.name ?? "value"));
+    }
+    block.append(element("div", "inspector-value", part.value.text));
+    const typeLine: HTMLElement = element("div", "inspector-type");
+    typeLine.append(element("code", "", part.value.ty));
+    if (part.value.units) {
+      typeLine.append(element("span", "", `   ${part.value.units}`));
+    }
+    const reference = check === undefined ? undefined : { verdict: check.verdict, referenceValue: check.values[at] ?? null };
+    block.append(typeLine, buildComponents(part.value, reference));
+    return block;
+  });
+}
+
+/** Every iteration the statements (or the loop) ran: the enclosing loops' variables, then theirs stacked. */
+function buildIterations(focus: TraceFocus, loops: number[]): HTMLElement {
+  const index: TraceIndex = focus.index;
+  const rows: IterationRow[] = index.rows(focus.points);
+  const section: HTMLElement = element("div", "");
+  section.append(element("h3", "", `${focus.isLoop ? "Iterations" : "Every iteration"} (${rows.length}${index.trace.isTruncated ? "+" : ""})`));
   const table: HTMLTableElement = element("table", "iterations");
   const header: HTMLTableRowElement = table.createTHead().insertRow();
-  for (const title of ["#", "loop", target.kind === "value" ? "value" : "", ""]) {
+  for (const title of ["#", focus.isLoop ? "outer loops" : "loops", focus.isLoop ? "loop variables" : "values", ""]) {
     header.append(element("th", "", title));
   }
+  // A loop's own variables are its values; the loops around it give the context
+  const contextLoops: number[] = focus.isLoop ? loops.slice(0, -1) : loops;
   const body: HTMLTableSectionElement = table.createTBody();
   let selected: HTMLTableRowElement | null = null;
-  for (const entryIndex of entries) {
-    const entry: TraceEntry = index.trace.entries[entryIndex];
-    const verdict: Verdict | undefined = reference?.trace[entryIndex]?.verdict;
-    const { mark, kind } = markOf(null, verdict === undefined ? undefined : { verdict }, true);
-    const row: HTMLTableRowElement = body.insertRow();
-    row.insertCell().textContent = iterationLabel(entry.iterations);
-    row.insertCell().textContent = index.loopVariables(loops, entry.iterations);
-    row.insertCell().textContent = target.kind === "value" ? (entry.values[0]?.text ?? "") : "";
-    row.insertCell().append(element("span", `mark ${kind}`, mark));
-    if (entryIndex === focus.entry) {
-      row.className = "selected";
-      selected = row;
+  for (const row of rows) {
+    const verdicts: (Verdict | undefined)[] = row.entries.map((entry: number | null) => (entry === null ? undefined : focus.reference?.trace[entry]?.verdict));
+    const worst: Verdict | undefined = worstVerdict(verdicts);
+    const { mark, kind } = markOf(null, worst === undefined ? undefined : { verdict: worst }, true);
+    const tableRow: HTMLTableRowElement = body.insertRow();
+    tableRow.insertCell().textContent = iterationLabel(row.iterations);
+    tableRow.insertCell().textContent = index.loopVariables(contextLoops, row.iterations);
+    const values: HTMLTableCellElement = tableRow.insertCell();
+    focus.points.forEach((point: number, at: number) => {
+      const entry: number | null = row.entries[at];
+      const names: string[] = index.trace.points[point].variables;
+      if (entry === null) {
+        for (const name of names.length > 0 ? names : ["value"]) {
+          values.append(element("div", "dim", `${name} = –`));
+        }
+        return;
+      }
+      for (const part of index.parts(entry)) {
+        const isAlone: boolean = focus.points.length === 1 && names.length <= 1 && !focus.isLoop;
+        values.append(element("div", "", isAlone || part.name === null ? part.value.text : `${part.name} = ${part.value.text}`));
+      }
+    });
+    tableRow.insertCell().append(element("span", `mark ${kind}`, mark));
+    if (row.entries.some((entry: number | null) => entry !== null && focus.entries.includes(entry))) {
+      tableRow.className = "selected";
+      selected = tableRow;
     }
-    row.addEventListener("click", () => onChoose(entryIndex));
+    const pick: number | null = row.entries.find((entry: number | null) => entry !== null) ?? null;
+    if (pick !== null) {
+      tableRow.addEventListener("click", () => focus.choose(pick));
+    }
   }
-  root.append(table);
-  if (index.trace.isTruncated) {
-    root.append(element("p", "dim small", "The loops ran longer: only their first values are kept."));
-  }
+  section.append(table);
   if (selected !== null) {
-    const row: HTMLTableRowElement = selected;
-    requestAnimationFrame(() => row.scrollIntoView({ block: "nearest" }));
+    const chosen: HTMLTableRowElement = selected;
+    requestAnimationFrame(() => chosen.scrollIntoView({ block: "nearest" }));
   }
-
-  root.append(element("h3", "", "Reference (DXC + WARP)"));
-  root.append(buildReference(reference));
-  return root;
+  return section;
 }
 
 function buildProblem(diagnostic: Diagnostic): HTMLElement {

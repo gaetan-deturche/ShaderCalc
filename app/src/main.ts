@@ -4,8 +4,10 @@ import { DocsPanel } from "./docs";
 import { COMMON_TYPES, KEYWORDS } from "./hlsl";
 import { buildInspector, buildTraceInspector, emptyInspector } from "./inspector";
 import { insertionOf, LibraryPanel } from "./library";
-import { DocEntry, DocumentText, Evaluation, Export, Line, LoadResult, OutsideChanges, Profile, Reference, UpdateInfo } from "./types";
-import { CompletionEntry, TraceFocus, WorksheetView } from "./worksheet-view";
+import { CallTrace, DocEntry, DocumentText, Evaluation, Export, Line, LoadResult, OutsideChanges, Profile, Reference, UpdateInfo } from "./types";
+import { CallPath } from "./peek";
+import { TraceFocus } from "./trace";
+import { CompletionEntry, WorksheetView } from "./worksheet-view";
 
 const EXTENSION: string = ".hlsl";
 /** The scratch pad: always the first tab; the other tabs are its libraries. */
@@ -106,6 +108,9 @@ function addTab(name: string, text: string, index: number = -1): WorksheetView {
     },
     onSelect: onLineSelected,
     completions: completionEntries,
+    traceCall: (line: Line, path: CallPath) => call<CallTrace | null>("traceCall", { generation: latestGeneration, index: line.index, path }),
+    checkCall: (line: Line, path: CallPath) => call<Reference | null>("checkCall", { generation: latestGeneration, index: line.index, path }),
+    documentText: (name: string) => views.find((candidate: WorksheetView) => candidate.name === name)?.text ?? null,
     intrinsics,
     resultWidth,
   });
@@ -381,13 +386,9 @@ function onLineSelected(view: WorksheetView): void {
     return;
   }
   const line: Line | null = view.selectedLine;
-  const focus: TraceFocus | null = line === null ? null : view.traceFocus();
+  const focus: TraceFocus | null = view.traceFocus();
   inspector.replaceChildren(
-    line === null
-      ? emptyInspector()
-      : focus !== null
-        ? buildTraceInspector(focus, view.referenceFor(line), (entry: number) => view.chooseEntry(focus.index, entry))
-        : buildInspector(line, view.sourceOf(line), view.referenceFor(line)),
+    focus !== null ? buildTraceInspector(focus) : line === null ? emptyInspector() : buildInspector(line, view.sourceOf(line), view.referenceFor(line)),
   );
 }
 

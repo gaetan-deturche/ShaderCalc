@@ -12,7 +12,9 @@ use crate::binding::type_rules::{self, ConversionInfo};
 use crate::diagnostics::{Diagnostic, DiagnosticBag, DiagnosticSeverity, SourceSpan};
 use crate::semantics::SemanticsProfile;
 use crate::syntax::tree::ParameterMode;
-use crate::trace::{LineTrace, MAX_TRACE_ENTRIES, TraceEntry, TracePointKind, trace_points};
+use crate::trace::{
+    CallEntry, CallTrace, LineTrace, MAX_TRACE_ENTRIES, TraceEntry, TracePointKind, call_sites, trace_points,
+};
 use crate::types::{ScalarKind, ShaderType};
 use crate::units::{Dimension, UnitTag};
 use crate::values::{Value, scalars};
@@ -142,15 +144,43 @@ pub struct Evaluator<'a> {
     current_source: Option<String>,
     /// Calls the reference can't be trusted on (WARP's own limits), in the order met.
     reference_limits: Vec<String>,
-    /// Set by `trace_line`: what the line's loops, ifs and blocks compute.
+    /// Set by `trace_line`: what the line's loops, ifs and blocks compute (or a followed call's body).
     tracer: Option<Tracer>,
+    /// Set by `follow_call`: the call to look inside.
+    follower: Option<Follower>,
 }
 
-/// A line's trace in progress: its points by statement node, and the iteration of each loop running.
+/// A trace in progress: its points by statement node, its call sites by expression node, the frame depth of the
+/// code it traces (1: the line), and the iteration of each loop running.
 struct Tracer {
     ids: HashMap<*const BoundStatement, usize>,
+    sites: HashMap<*const BoundExpression, usize>,
+    depth: usize,
     trace: LineTrace,
     iterations: Vec<u32>,
+}
+
+impl Tracer {
+    fn new(statement: &BoundStatement, depth: usize) -> Tracer {
+        let (points, ids) = trace_points(statement);
+        let (calls, sites) = call_sites(statement);
+        Tracer { ids, sites, depth, trace: LineTrace { points, calls, ..LineTrace::default() }, iterations: Vec::new() }
+    }
+}
+
+/// Re-running a line to look inside one call: the calls to enter (a site of the code that makes it, and which of
+/// its runs), level by level, and the sites of the code at the current level.
+struct Follower {
+    path: Vec<(usize, usize)>,
+    /// How many of the path's calls are entered.
+    level: usize,
+    /// Frame depth of the code at the current level (1: the line).
+    depth: usize,
+    sites: HashMap<*const BoundExpression, usize>,
+    runs: HashMap<usize, usize>,
+    arguments: Vec<Value>,
+    is_finished: bool,
+    result: Option<CallTrace>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -188,26 +218,109 @@ impl<'a> Evaluator<'a> {
             current_source: None,
             reference_limits: Vec::new(),
             tracer: None,
+            follower: None,
         }
     }
 
-    /// Records what the next `run_line` of this statement computes inside its loops, ifs and blocks.
+    /// Records what the next `run_line` of this statement computes inside its loops, ifs and blocks, and the
+    /// worksheet functions it calls.
     pub fn trace_line(&mut self, statement: &BoundStatement) {
-        let (points, ids) = trace_points(statement);
-        self.tracer = (!points.is_empty()).then(|| Tracer {
-            ids,
-            trace: LineTrace { points, ..LineTrace::default() },
-            iterations: Vec::new(),
-        });
+        let tracer: Tracer = Tracer::new(statement, 1);
+        self.tracer = (!tracer.trace.points.is_empty() || !tracer.trace.calls.is_empty()).then_some(tracer);
     }
 
     pub fn take_trace(&mut self) -> Option<LineTrace> {
         self.tracer.take().map(|tracer| tracer.trace)
     }
 
-    /// The trace point of a statement, when the line is traced and it is one.
+    /// The next run of this line statement traces the call `path` leads to: the `occurrence`-th run of call `site`
+    /// (numbered like `call_sites`) in the line, then in that function's body, and so on.
+    pub fn follow_call(&mut self, statement: &BoundStatement, path: Vec<(usize, usize)>) {
+        let (_, sites) = call_sites(statement);
+        self.follower = Some(Follower {
+            path,
+            level: 0,
+            depth: 1,
+            sites,
+            runs: HashMap::new(),
+            arguments: Vec::new(),
+            is_finished: false,
+            result: None,
+        });
+    }
+
+    pub fn take_call_trace(&mut self) -> Option<CallTrace> {
+        self.follower.take().and_then(|follower| follower.result)
+    }
+
+    /// The trace point of a statement, when its code is traced and it is one.
     fn trace_point(&self, statement: &BoundStatement) -> Option<usize> {
-        self.tracer.as_ref()?.ids.get(&(statement as *const BoundStatement)).copied()
+        let tracer: &Tracer = self.tracer.as_ref().filter(|tracer| tracer.depth == self.frames.len())?;
+        tracer.ids.get(&(statement as *const BoundStatement)).copied()
+    }
+
+    /// A call of the traced code runs: noted with the iterations around it.
+    fn record_call(&mut self, expression: &BoundExpression) {
+        let depth: usize = self.frames.len();
+        let Some(tracer) = self.tracer.as_mut().filter(|tracer| tracer.depth == depth) else {
+            return;
+        };
+        if let Some(site) = tracer.sites.get(&(expression as *const BoundExpression)).copied() {
+            if tracer.trace.call_entries.len() >= MAX_TRACE_ENTRIES {
+                tracer.trace.is_truncated = true;
+                return;
+            }
+            tracer.trace.call_entries.push(CallEntry { site, iterations: tracer.iterations.clone() });
+        }
+    }
+
+    /// Whether this call is the next one the follower enters (counting the runs of its site).
+    fn is_followed_call(&mut self, expression: &BoundExpression) -> bool {
+        let depth: usize = self.frames.len();
+        let Some(follower) = self.follower.as_mut().filter(|follower| !follower.is_finished && follower.depth == depth)
+        else {
+            return false;
+        };
+        let Some(site) = follower.sites.get(&(expression as *const BoundExpression)).copied() else {
+            return false;
+        };
+        let runs: &mut usize = follower.runs.entry(site).or_insert(0);
+        let occurrence: usize = *runs;
+        *runs += 1;
+        follower.path.get(follower.level) == Some(&(site, occurrence))
+    }
+
+    /// Inside a followed call (its frame pushed): the next level's sites, or the body to trace.
+    fn enter_followed(&mut self, function: &FunctionRef, body: &BoundStatement) {
+        let depth: usize = self.frames.len();
+        let arguments: Vec<Value> =
+            function.parameters.iter().filter_map(|parameter| self.frame().locals.get(parameter).cloned()).collect();
+        let follower: &mut Follower = self.follower.as_mut().expect("a follower");
+        follower.level += 1;
+        follower.depth = depth;
+        if follower.level == follower.path.len() {
+            follower.arguments = arguments;
+            self.tracer = Some(Tracer::new(body, depth));
+        } else {
+            follower.sites = call_sites(body).1;
+            follower.runs.clear();
+        }
+    }
+
+    /// Out of a followed call (its frame popped): the trace when it was the last, else nothing further was found.
+    fn leave_followed(&mut self, function: &FunctionRef, outcome: &EvalResult<Value>) {
+        let trace: Option<LineTrace> = self.tracer.take().map(|tracer| tracer.trace);
+        let follower: &mut Follower = self.follower.as_mut().expect("a follower");
+        if follower.is_finished {
+            return;
+        }
+        follower.is_finished = true;
+        if let Some(trace) = trace.filter(|_| follower.level == follower.path.len()) {
+            let result: Option<Value> = outcome.as_ref().ok().filter(|value| !value.ty.is_void()).cloned();
+            let arguments: Vec<Value> = std::mem::take(&mut follower.arguments);
+            follower.result =
+                Some(CallTrace { function: function.clone(), arguments, result, trace, first_line: 0, last_line: 0 });
+        }
     }
 
     /// A traced loop starts an iteration: its variables as they stand.
@@ -218,18 +331,26 @@ impl<'a> Evaluator<'a> {
         if let Some(current) = tracer.iterations.last_mut() {
             *current = iteration;
         }
-        let variables: Vec<VariableRef> = match &tracer.trace.points[point].kind {
-            TracePointKind::Loop { variables } => variables.clone(),
-            TracePointKind::Value { .. } => Vec::new(),
-        };
-        let values: Vec<Value> = variables
+        let values: Vec<Value> = self.point_variables(point).unwrap_or_default();
+        self.record(point, values);
+    }
+
+    /// The values of the variables a trace point holds, as they stand (None for a plain value).
+    fn point_variables(&self, point: usize) -> Option<Vec<Value>> {
+        let tracer: &Tracer = self.tracer.as_ref()?;
+        let kind: &TracePointKind = &tracer.trace.points[point].kind;
+        if matches!(kind, TracePointKind::Value { .. }) {
+            return None;
+        }
+        let values: Vec<Value> = kind
+            .variables()
             .iter()
             .map(|variable| {
                 self.read_variable(variable, SourceSpan::NONE)
                     .unwrap_or_else(|_| Value::zero(variable.ty.clone(), UnitTag::BARE))
             })
             .collect();
-        self.record(point, values);
+        Some(values)
     }
 
     fn record(&mut self, point: usize, values: Vec<Value>) {
@@ -329,7 +450,7 @@ impl<'a> Evaluator<'a> {
             frame.locals.insert(parameter.clone(), value);
         }
         let span: SourceSpan = function.syntax().name_span;
-        self.invoke(function, frame, span).map(|(result, _)| result)
+        self.invoke(function, frame, span, false).map(|(result, _)| result)
     }
 
     // ---------------------------------------------------------------- Diagnostics
@@ -411,7 +532,8 @@ impl<'a> Evaluator<'a> {
             BoundStatementKind::Expression(expression) => {
                 let value: Value = self.evaluate(expression)?;
                 if let Some(point) = self.trace_point(statement) {
-                    self.record(point, vec![value.clone()]);
+                    let values: Vec<Value> = self.point_variables(point).unwrap_or_else(|| vec![value.clone()]);
+                    self.record(point, values);
                 }
                 self.last_result = Some(value);
                 Ok(Flow::Normal)
@@ -449,6 +571,9 @@ impl<'a> Evaluator<'a> {
                     None => None,
                     Some(value) => Some(self.evaluate(value)?),
                 };
+                if let (Some(point), Some(value)) = (self.trace_point(statement), self.return_value.clone()) {
+                    self.record(point, vec![value]);
+                }
                 Ok(Flow::Return)
             }
             BoundStatementKind::Jump { is_break } => Ok(if *is_break { Flow::Break } else { Flow::Continue }),
@@ -566,7 +691,9 @@ impl<'a> Evaluator<'a> {
             }
             BoundExpressionKind::Call { function, arguments, .. } => {
                 self.not_in_constant_mode()?;
-                self.evaluate_call(function, arguments, expression.span)
+                self.record_call(expression);
+                let is_followed: bool = self.is_followed_call(expression);
+                self.evaluate_call(function, arguments, expression.span, is_followed)
             }
             BoundExpressionKind::IntrinsicCall { intrinsic, signature, arguments, constant_arguments } => {
                 let mut values: Vec<Value> = Vec::with_capacity(arguments.len());
@@ -922,6 +1049,7 @@ impl<'a> Evaluator<'a> {
         function: &FunctionRef,
         arguments: &[BoundExpression],
         span: SourceSpan,
+        is_followed: bool,
     ) -> EvalResult<Value> {
         let mut frame: Frame = Frame::new(Some(function.clone()));
         let mut write_backs: Vec<(Place, VariableRef)> = Vec::new();
@@ -942,7 +1070,7 @@ impl<'a> Evaluator<'a> {
             write_backs.push((place, parameter.clone()));
         }
 
-        let (result, frame) = self.invoke(function, frame, span)?;
+        let (result, frame) = self.invoke(function, frame, span, is_followed)?;
         for (place, parameter) in write_backs {
             let value: Value = self.convert_implicitly(frame.locals[&parameter].clone(), &place.ty);
             self.write(&place, &value);
@@ -950,7 +1078,14 @@ impl<'a> Evaluator<'a> {
         Ok(result)
     }
 
-    fn invoke(&mut self, function: &FunctionRef, frame: Frame, span: SourceSpan) -> EvalResult<(Value, Frame)> {
+    /// `is_followed`: the call `follow_call` looks inside (or one on the way to it).
+    fn invoke(
+        &mut self,
+        function: &FunctionRef,
+        frame: Frame,
+        span: SourceSpan,
+        is_followed: bool,
+    ) -> EvalResult<(Value, Frame)> {
         let Some(body) = function.body() else {
             return failure(format!("'{}' has no body", function.name), span);
         };
@@ -958,6 +1093,9 @@ impl<'a> Evaluator<'a> {
             return failure("calls nested too deep (recursion isn't allowed in HLSL)", span);
         }
         self.frames.push(frame);
+        if is_followed {
+            self.enter_followed(function, &body);
+        }
         self.call_depth += 1;
         self.return_value = None;
         let outcome: EvalResult<Value> = self.execute(&body).and_then(|flow| {
@@ -973,6 +1111,9 @@ impl<'a> Evaluator<'a> {
         });
         self.call_depth -= 1;
         let frame: Frame = self.frames.pop().expect("the callee's frame");
+        if is_followed {
+            self.leave_followed(function, &outcome);
+        }
         match outcome {
             Ok(value) => Ok((value, frame)),
             Err(Interrupt::Error(mut error)) => {
