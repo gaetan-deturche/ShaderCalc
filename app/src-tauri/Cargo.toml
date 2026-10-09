@@ -1,6 +1,6 @@
 [package]
 name = "shadercalc"
-version = "0.5.0"
+version = "0.6.0"
 edition.workspace = true
 description = "ShaderCalc: HLSL worksheets checked against DXC + WARP"
 
