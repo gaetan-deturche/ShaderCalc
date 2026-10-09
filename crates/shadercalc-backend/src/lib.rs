@@ -17,7 +17,7 @@ use shadercalc_core::semantics::SemanticsProfile;
 use shadercalc_core::units::UNITS;
 use shadercalc_core::worksheet::{self, WorksheetDocument, WorksheetResult};
 
-use dto::{DiagnosticDto, DocDto, EvaluationDto, LineDto, ReferenceDto, SymbolDto};
+use dto::{DiagnosticDto, DocDto, EvaluationDto, ExportDto, LineDto, ReferenceDto, SymbolDto};
 use store::{OutsideChanges, WorksheetStore};
 
 #[derive(Deserialize)]
@@ -215,6 +215,7 @@ impl Backend {
             lines: result.lines.iter().enumerate().map(|(index, line)| LineDto::new(index, line)).collect(),
             diagnostics: result.diagnostics.iter().map(DiagnosticDto::from).collect(),
             symbols,
+            exports: result.exports.iter().map(ExportDto::from).collect(),
         };
         *self.last.lock().expect("evaluation lock") = Some((generation, Arc::new(result), profile));
         serde_json::to_value(evaluation).map_err(|error| error.to_string())

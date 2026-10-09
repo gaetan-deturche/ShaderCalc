@@ -64,6 +64,10 @@ component is raw `u64` bits plus a `UnitTag`).
   lines and problems, then runs each library alone (its lines, its errors), adding the problems only the
   combination has (a name two libraries define).
 - `evaluate`: documents as one program in order. Declarations are hoisted; top-level lines run in order.
+- `exports.rs`: `WorksheetResult::exports`, what each document declares (from `evaluate_with_libraries`: each
+  library's own run). Built from the syntax items (declaration text sliced from the source by span, UTF-16 →
+  byte, comments stripped, one line), `Preprocessor::definitions` for macros and the lines' declared variables
+  (with the line's value). The comment is the `//` block above, else a trailing `//`.
 - A newline ends a top-level statement unless a bracket is open (`Parser::at_line_break`).
 - A top-level variable (declared, or `x = v` for a new name) is a global that functions can read.
 - Each line gets its own evaluator over shared storage, its own diagnostics, and a snapshot of the globals it
@@ -108,7 +112,10 @@ component is raw `u64` bits plus a `UnitTag`).
   wrapping: it would break the alignment. Squiggles and hover through `@codemirror/lint`, plus completion.
   `hlsl.ts`: a `StreamLanguage` from the legacy clike mode (`indentStatements: false`, else new lines indent).
 - `inspector.ts`: type, units, per-component value/hex/bits, problems, the reference verdict and the emitted HLSL.
-  `docs.ts`: the docs panel (`marked`).
+  `docs.ts`: the docs panel (`marked`). `library.ts`: the Library panel from `evaluate`'s `exports`, grouped by
+  library in tab order (re-rendered only when they change). Click → `WorksheetView.insertSnippet` in the scratch
+  pad (a CodeMirror snippet, parameters as numbered fields; it replaces a partly typed name, stays inline in an
+  expression or on a blank line, else goes on a new line); Ctrl+click → `goTo` the name's offset.
 - Docs: `crates/shadercalc-core/src/docs/reference.md` (`include_str!`) has the topics plus one `## name` page per
   intrinsic; the signature line is formatted `` `sig` · kinds ``. `tests/documentation.rs` checks that the pages and
   the intrinsic table match.
@@ -146,7 +153,7 @@ component is raw `u64` bits plus a `UnitTag`).
 - Browser, for frontend work: `cargo run -p shadercalc-devserver` (with `SHADERCALC_DATA_DIR=Claude\ui-data` to
   keep the user's worksheets out of it) and `npm run dev` in `app`, then http://localhost:1420 in the built-in
   browser pane. Vite listens on `::1`: use `localhost`, not 127.0.0.1. Test hook:
-  `window.shaderCalc.{results, activeName, tabNames, profile}`. Pane screenshots time out while the pane is hidden; read
+  `window.shaderCalc.{results, activeName, tabNames, profile, library}`. Pane screenshots time out while the pane is hidden; read
   the page with `get_page_text` / `javascript_tool` instead.
 - Desktop exe: hidden desktop only (shared memory `no-focus-steal-gui-testing`). The tooling is in `Claude/`
   (gitignored). `run-hidden.ps1 -Driver tauri-drive.ps1 -TimeoutSeconds 300` creates the `ShaderCalcTest` desktop

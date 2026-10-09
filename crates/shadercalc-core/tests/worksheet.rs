@@ -166,3 +166,50 @@ fn a_library_stands_alone() {
         result.diagnostics
     );
 }
+
+#[test]
+fn libraries_export_their_declarations() {
+    let library: &str = "// GGX normal distribution\n//\n// (Trowbridge-Reitz)\n\
+        float D_GGX(float NoH, float roughness, float scale = 1.0)\n{\n    return roughness;\n}\n\
+        float Proto(float x);\nfloat Proto(float x) { return x; }\n\
+        struct Surface\n{\n    float3 normal; // unit length\n    float roughness;\n};\n\
+        typedef float3 Color;\n\
+        #define PI 3.14159265 // pi\n#define SQUARE(x) ((x) * (x))\n#define GONE 1\n#undef GONE\n\
+        static const float kA = 1, kB[2] = { 2, 3 };\n\
+        cbuffer Settings { float exposure; }\n\
+        albedo = float3(0.5, 0.5, 0.5)\n\
+        float é = 2 // UTF-16 offsets\n\
+        float gain = 3";
+    let result: WorksheetResult = run_with_libraries(&[
+        ("scratch.hlsl", "float Mine(float x) { return x; }\nD_GGX(1, 2)"),
+        ("lib.hlsl", library),
+    ]);
+    let rows: Vec<String> = result
+        .exports
+        .iter()
+        .map(|export| {
+            assert_eq!("lib.hlsl", export.document);
+            let parameters: String =
+                export.parameters.as_ref().map_or(String::new(), |names| format!(" ({})", names.join(", ")));
+            format!("{} {}: {}{parameters} // {}", export.line, export.kind.name(), export.declaration, export.comment)
+        })
+        .collect();
+    let expected: [&str; 12] = [
+        "4 function: float D_GGX(float NoH, float roughness, float scale = 1.0) (NoH, roughness) // GGX normal distribution (Trowbridge-Reitz)",
+        "9 function: float Proto(float x) (x) // ",
+        "10 struct: struct Surface { float3 normal; float roughness; } // ",
+        "15 type: typedef float3 Color // ",
+        "16 macro: #define PI 3.14159265 // pi",
+        "17 macro: #define SQUARE(x) ((x) * (x)) (x) // ",
+        "20 variable: static const float kA = 1 // ",
+        "20 variable: static const float kB[2] = { 2, 3 } // ",
+        "21 variable: float exposure // ",
+        "22 variable: float3 albedo = float3(0.5, 0.5, 0.5) // ",
+        "23 variable: float é = 2 // UTF-16 offsets",
+        "24 variable: float gain = 3 // ",
+    ];
+    assert_eq!(expected[..], rows[..], "{rows:#?}");
+    // Offsets are UTF-16 units of the name, like the editor's
+    let gain: usize = library.encode_utf16().count() - "gain = 3".len();
+    assert_eq!(gain, result.exports[11].offset);
+}

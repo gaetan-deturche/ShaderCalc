@@ -9,6 +9,7 @@ pub mod binding;
 pub mod diagnostics;
 pub mod docs;
 pub mod evaluation;
+pub mod exports;
 pub mod reference;
 pub mod semantics;
 pub mod session;

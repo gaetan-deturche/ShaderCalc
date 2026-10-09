@@ -1,4 +1,4 @@
-import { autocompletion, closeBrackets, closeBracketsKeymap, CompletionContext, CompletionResult, completionKeymap } from "@codemirror/autocomplete";
+import { autocompletion, closeBrackets, closeBracketsKeymap, CompletionContext, CompletionResult, completionKeymap, snippet } from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { bracketMatching, indentOnInput, indentUnit, syntaxHighlighting } from "@codemirror/language";
 import { Diagnostic as LintDiagnostic, lintKeymap, setDiagnostics } from "@codemirror/lint";
@@ -193,6 +193,34 @@ export class WorksheetView {
     this.isReplacingText = true;
     this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: text }, selection: { anchor: caret } });
     this.isReplacingText = false;
+  }
+
+  /**
+   * Types a CodeMirror snippet (Tab moves between its `${}` fields) for `name` where it reads as code: over the
+   * selection or a partly typed `name`, at the caret inside an expression or on a blank line, else on a new line
+   * after the caret's.
+   */
+  insertSnippet(template: string, name: string): void {
+    let { from, to } = this.view.state.selection.main;
+    const line = this.view.state.doc.lineAt(from);
+    const before: string = line.text.slice(0, from - line.from);
+    const word: string = /[\p{L}\p{N}_]*$/u.exec(before)?.[0] ?? "";
+    const isInExpression: boolean = /[(\[{,=+\-*/%<>&|^!?:~]\s*$/.test(before);
+    if (from === to && word !== "" && name.toLowerCase().startsWith(word.toLowerCase())) {
+      from -= word.length;
+    } else if (from === to && line.text.trim() !== "" && !isInExpression) {
+      from = to = line.to;
+      template = `\n${template}`;
+    }
+    snippet(template)(this.view, null, from, to);
+    this.view.focus();
+  }
+
+  /** Puts the caret at an offset, scrolled to the middle. */
+  goTo(offset: number): void {
+    const position: number = Math.min(Math.max(offset, 0), this.view.state.doc.length);
+    this.view.dispatch({ selection: { anchor: position }, effects: EditorView.scrollIntoView(position, { y: "center" }) });
+    this.view.focus();
   }
 
   /** The identifier under the caret (for F1). */

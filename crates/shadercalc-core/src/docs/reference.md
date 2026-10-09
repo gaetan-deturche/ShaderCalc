@@ -18,6 +18,8 @@ asuint(n.x)
 
 Click a result (or put the caret on its line) to see its type, every component's bits, its units and the reference check.
 
+The Library tab (next to Docs) lists what each library declares, with the `//` comment above each declaration: functions, structs, `typedef`s, `#define`s, globals and the variables its lines create. Click one to type it into the scratch pad (a call gets its parameters as fields: Tab moves between them), Ctrl+click to open its declaration. The filter box matches names, declarations and comments; ↑↓ and Enter work from it.
+
 ## Reference check
 Every result also runs on a real HLSL compiler and GPU executor: DXC compiles the line (with the code it uses) to DXIL, and Direct3D 12's WARP adapter, the software GPU shipped with Windows, executes it. The line's literals, variables and uniforms are fed through a buffer, so WARP really computes the line instead of DXC folding it.
 

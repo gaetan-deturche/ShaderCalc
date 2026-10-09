@@ -1,6 +1,7 @@
 use serde::Serialize;
 use shadercalc_core::diagnostics::{Diagnostic, DiagnosticSeverity};
 use shadercalc_core::docs::DocEntry;
+use shadercalc_core::exports::Export;
 use shadercalc_core::reference::checker::{ReferenceOutcome, ReferenceVerdict};
 use shadercalc_core::types::{ScalarKind, ShaderType};
 use shadercalc_core::units::Dimension;
@@ -211,6 +212,35 @@ pub struct SymbolDto {
     pub detail: String,
 }
 
+/// A library's declaration, for the Library panel.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportDto {
+    pub document: String,
+    pub kind: &'static str,
+    pub name: String,
+    pub declaration: String,
+    pub parameters: Option<Vec<String>>,
+    pub comment: String,
+    pub line: usize,
+    pub offset: usize,
+}
+
+impl From<&Export> for ExportDto {
+    fn from(export: &Export) -> ExportDto {
+        ExportDto {
+            document: export.document.clone(),
+            kind: export.kind.name(),
+            name: export.name.clone(),
+            declaration: export.declaration.clone(),
+            parameters: export.parameters.clone(),
+            comment: export.comment.clone(),
+            line: export.line,
+            offset: export.offset,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvaluationDto {
@@ -219,6 +249,7 @@ pub struct EvaluationDto {
     pub lines: Vec<LineDto>,
     pub diagnostics: Vec<DiagnosticDto>,
     pub symbols: Vec<SymbolDto>,
+    pub exports: Vec<ExportDto>,
 }
 
 #[derive(Clone, Debug, Serialize)]

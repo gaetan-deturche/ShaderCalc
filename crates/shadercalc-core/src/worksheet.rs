@@ -7,11 +7,12 @@ use crate::binding::program::{BoundInteractive, BoundProgram, BoundWorksheet, Wo
 use crate::binding::symbols::VariableRef;
 use crate::diagnostics::{Diagnostic, DiagnosticBag, DiagnosticSeverity, SourceSpan};
 use crate::evaluation::evaluator::{EvaluationOptions, Evaluator, Interrupt, Storage};
+use crate::exports::{Export, exports_of};
 use crate::semantics::SemanticsProfile;
 use crate::session::{LineResult, materialize};
 use crate::syntax::lexer::{Token, tokenize};
 use crate::syntax::parser::parse_worksheet;
-use crate::syntax::preprocessor::Preprocessor;
+use crate::syntax::preprocessor::{MacroDefinition, Preprocessor};
 use crate::syntax::tree::{DeclarationSyntax, ExpressionKind, ItemSyntax, StatementKind};
 use crate::units::UNITS;
 use crate::values::Value;
@@ -49,6 +50,8 @@ pub struct WorksheetResult {
     pub program: Arc<BoundProgram>,
     pub lines: Vec<WorksheetLine>,
     pub diagnostics: Vec<Diagnostic>,
+    /// What the documents declare (with libraries: what each library declares on its own).
+    pub exports: Vec<Export>,
     pub duration: Duration,
 }
 
@@ -77,10 +80,10 @@ pub fn evaluate(
     let clock: Instant = Instant::now();
 
     // `2 h` is hours, unless the worksheet names something h
-    let (mut sources, mut parse_diagnostics) = parse(documents, &|name: &str| UNITS.contains_key(name));
+    let (mut sources, mut parse_diagnostics, mut macros) = parse(documents, &|name: &str| UNITS.contains_key(name));
     let declared_names: HashSet<String> = sources.iter().flat_map(|source| declared_names(&source.items)).collect();
     if declared_names.iter().any(|name| UNITS.contains_key(name.as_str())) {
-        (sources, parse_diagnostics) =
+        (sources, parse_diagnostics, macros) =
             parse(documents, &|name: &str| UNITS.contains_key(name) && !declared_names.contains(name));
     }
 
@@ -182,10 +185,16 @@ pub fn evaluate(
         };
         lines.push(WorksheetLine { document: line.source.clone(), line: last_line, span: line.span, result });
     }
+    let exports: Vec<Export> = documents
+        .iter()
+        .zip(&sources)
+        .flat_map(|(document, source)| exports_of(document, source, &macros, &lines))
+        .collect();
     Ok(WorksheetResult {
         program: bound.program,
         lines,
         diagnostics: all_diagnostics.into_items(),
+        exports,
         duration: clock.elapsed(),
     })
 }
@@ -212,25 +221,27 @@ pub fn evaluate_with_libraries(
     let mut duration: Duration = combined.duration;
     let mut lines: Vec<WorksheetLine> = Vec::new();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    let mut exports: Vec<Export> = Vec::new();
     lines.extend(combined.lines.iter().filter(|line| line.document == scratch_document.name).cloned());
     diagnostics.extend(combined.diagnostics_of(&scratch_document.name).cloned());
     for library in libraries {
         let alone: WorksheetResult = evaluate(std::slice::from_ref(library), profile, options)?;
         duration += alone.duration;
         lines.extend(alone.lines);
+        exports.extend(alone.exports);
         for diagnostic in alone.diagnostics.iter().chain(combined.diagnostics_of(&library.name)) {
             if !diagnostics.contains(diagnostic) {
                 diagnostics.push(diagnostic.clone());
             }
         }
     }
-    Ok(WorksheetResult { program: combined.program, lines, diagnostics, duration })
+    Ok(WorksheetResult { program: combined.program, lines, diagnostics, exports, duration })
 }
 
 fn parse(
     documents: &[WorksheetDocument],
     is_unit_name: &dyn Fn(&str) -> bool,
-) -> (Vec<WorksheetSource>, Vec<Diagnostic>) {
+) -> (Vec<WorksheetSource>, Vec<Diagnostic>, Vec<MacroDefinition>) {
     let mut diagnostics: DiagnosticBag = DiagnosticBag::new();
     let mut preprocessor: Preprocessor = Preprocessor::create_shared();
     let mut type_names: Vec<String> = Vec::new();
@@ -251,7 +262,7 @@ fn parse(
         }
         sources.push(WorksheetSource { name: document.name.clone(), items });
     }
-    (sources, diagnostics.into_items())
+    (sources, diagnostics.into_items(), preprocessor.definitions)
 }
 
 pub(crate) fn declared_names(items: &[ItemSyntax]) -> Vec<String> {

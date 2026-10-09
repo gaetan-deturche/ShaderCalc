@@ -24,6 +24,8 @@
           <div class="side-tabs" role="tablist">
             <button class="side-tab active" data-panel="inspector" id="inspector-tab">Inspector</button>
             <button class="side-tab" data-panel="docs" id="docs-tab">Docs</button>
+            <button class="side-tab" data-panel="library" id="library-tab"
+              title="What the libraries declare: click to insert into the scratch pad, Ctrl+click to go to the declaration">Library</button>
           </div>
           <div class="panel" id="inspector"></div>
           <div class="panel docs hidden" id="docs">
@@ -32,6 +34,11 @@
             <div class="docs-list" id="docs-list" role="listbox"></div>
             <div class="splitter horizontal" id="docs-splitter"></div>
             <div class="docs-page" id="docs-page"></div>
+          </div>
+          <div class="panel library hidden" id="library">
+            <input id="library-search" type="search" placeholder="Filter the libraries" spellcheck="false"
+              title="Filter by name, declaration or comment; ↑↓ select, Enter inserts, Ctrl+Enter goes to the declaration" />
+            <div class="library-list" id="library-list" role="listbox"></div>
           </div>
         </aside>
       </main>

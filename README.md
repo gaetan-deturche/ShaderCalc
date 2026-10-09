@@ -15,6 +15,8 @@ tanh(7.0)                                  // ⊘ 0.99999833 (WARP's tanh is off
   on the right; the other tabs are libraries it sees, as if included in front of it. Each library also runs on its
   own, so its own lines are local tests and a dependency on another library shows up as an error. A line break
   ends a line. Results update as you type.
+- **Library**: a side tab lists what every library declares (functions, structs, macros, globals) with their
+  comments; a click types the call into the scratch pad, Ctrl+click opens the declaration.
 - **HLSL semantics**: a custom interpreter computes what DXC + WARP compute: 64-bit literals until they meet a
   type, denormal flushing, unfused `mad`, masked shift counts, round-half-even, DXC's lowering of intrinsics
   (`pow`, `smoothstep`, `normalize`, `fmod`, ...). Scalars (incl. `int64`/`double`), vectors, matrices,

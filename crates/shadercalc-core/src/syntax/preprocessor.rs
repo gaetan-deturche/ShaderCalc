@@ -12,12 +12,23 @@ struct Macro {
     body: Vec<Token>,
 }
 
+/// A `#define` the files declared (and didn't `#undef`): its file and the span of the whole directive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MacroDefinition {
+    pub name: String,
+    pub parameters: Option<Vec<String>>,
+    pub source: String,
+    pub span: SourceSpan,
+}
+
 /// C preprocessor subset: #define (object-like and function-like, # and ##), #undef, #if/#ifdef/#ifndef/#elif/
 /// #else/#endif, #error. #include, #pragma and #line are ignored. Expanded tokens keep the invocation's position.
 pub struct Preprocessor {
     macros: HashMap<String, Macro>,
     source_name: String,
     diagnostics: DiagnosticBag,
+    /// The `#define`s of the files processed, in order.
+    pub definitions: Vec<MacroDefinition>,
 }
 
 impl Preprocessor {
@@ -33,7 +44,12 @@ impl Preprocessor {
             macros
                 .insert(name.to_string(), Macro { name: name.to_string(), parameters: None, is_variadic: false, body });
         }
-        Preprocessor { macros, source_name: source_name.to_string(), diagnostics: DiagnosticBag::new() }
+        Preprocessor {
+            macros,
+            source_name: source_name.to_string(),
+            diagnostics: DiagnosticBag::new(),
+            definitions: Vec::new(),
+        }
     }
 
     pub fn process(tokens: Vec<Token>, source_name: &str, diagnostics: &mut DiagnosticBag) -> Vec<Token> {
@@ -116,10 +132,11 @@ impl Preprocessor {
                     Some((_, _, parent_active)) => active = parent_active,
                     None => self.report(&line[0], "#endif without #if".to_string()),
                 },
-                "define" if active => self.define(&line),
+                "define" if active => self.define(&line, token.span),
                 "undef" if active => {
                     let name: String = self.name_at(&line, 1);
                     self.macros.remove(&name);
+                    self.definitions.retain(|definition| definition.name != name);
                 }
                 "error" if active => {
                     let message: Vec<&str> = line.iter().skip(1).map(|part| part.text.as_str()).collect();
@@ -160,7 +177,7 @@ impl Preprocessor {
         String::new()
     }
 
-    fn define(&mut self, line: &[Token]) {
+    fn define(&mut self, line: &[Token], hash: SourceSpan) {
         let name: String = self.name_at(line, 1);
         if name.is_empty() {
             return;
@@ -185,6 +202,13 @@ impl Preprocessor {
             body_start = position + 1;
         }
         let body: Vec<Token> = line.iter().skip(body_start).cloned().collect();
+        self.definitions.retain(|definition| definition.name != name);
+        self.definitions.push(MacroDefinition {
+            name: name.clone(),
+            parameters: parameters.clone(),
+            source: self.source_name.clone(),
+            span: hash.to(line[line.len() - 1].span),
+        });
         self.macros.insert(name.clone(), Macro { name, parameters, is_variadic, body });
     }
 

@@ -74,12 +74,26 @@ export interface Symbol {
   detail: string;
 }
 
+/** A library's declaration (the Library panel). `offset` is where its name is. */
+export interface Export {
+  document: string;
+  kind: "function" | "struct" | "type" | "macro" | "variable";
+  name: string;
+  declaration: string;
+  /** What a call takes (functions, function-like macros). */
+  parameters: string[] | null;
+  comment: string;
+  line: number;
+  offset: number;
+}
+
 export interface Evaluation {
   generation: number;
   durationMs: number;
   lines: Line[];
   diagnostics: Diagnostic[];
   symbols: Symbol[];
+  exports: Export[];
 }
 
 export type Verdict = "match" | "withinTolerance" | "mismatch" | "warpLimit" | "notChecked";

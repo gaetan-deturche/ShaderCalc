@@ -3,7 +3,8 @@ import { appCommand, call, isTauri } from "./api";
 import { DocsPanel } from "./docs";
 import { COMMON_TYPES, KEYWORDS } from "./hlsl";
 import { buildInspector, emptyInspector } from "./inspector";
-import { DocEntry, DocumentText, Evaluation, Line, LoadResult, OutsideChanges, Profile, Reference, UpdateInfo } from "./types";
+import { insertionOf, LibraryPanel } from "./library";
+import { DocEntry, DocumentText, Evaluation, Export, Line, LoadResult, OutsideChanges, Profile, Reference, UpdateInfo } from "./types";
 import { CompletionEntry, WorksheetView } from "./worksheet-view";
 
 const EXTENSION: string = ".hlsl";
@@ -20,6 +21,7 @@ const app: HTMLElement = document.getElementById("app") as HTMLElement;
 const profileSelect: HTMLSelectElement = document.getElementById("profile-select") as HTMLSelectElement;
 
 const docs: DocsPanel = new DocsPanel();
+const library: LibraryPanel = new LibraryPanel({ insert: insertExport, reveal: revealExport });
 const views: WorksheetView[] = [];
 const unsaved: Set<WorksheetView> = new Set();
 let active: WorksheetView | null = null;
@@ -299,6 +301,10 @@ async function runEvaluation(): Promise<void> {
       result.diagnostics.filter((diagnostic) => diagnostic.source === view.name),
     );
   }
+  library.update(
+    result.exports,
+    views.filter((view: WorksheetView) => !isScratch(view.name)).map((view: WorksheetView) => ({ name: view.name, title: displayName(view.name) })),
+  );
   const errors: number = result.diagnostics.filter((diagnostic) => diagnostic.severity === "error").length;
   const shown: number = result.lines.filter((line: Line) => line.value !== null).length;
   statusText.textContent =
@@ -378,12 +384,34 @@ function onLineSelected(view: WorksheetView): void {
 
 // ---------------------------------------------------------------- Side panel
 
-function showPanel(panel: "inspector" | "docs"): void {
+type Panel = "inspector" | "docs" | "library";
+
+function showPanel(panel: Panel): void {
   for (const tab of document.querySelectorAll<HTMLElement>(".side-tab")) {
     tab.classList.toggle("active", tab.dataset.panel === panel);
   }
   inspector.classList.toggle("hidden", panel !== "inspector");
   (document.getElementById("docs") as HTMLElement).classList.toggle("hidden", panel !== "docs");
+  (document.getElementById("library") as HTMLElement).classList.toggle("hidden", panel !== "library");
+}
+
+/** A Library entry clicked: typed at the scratch pad's caret. */
+function insertExport(entry: Export): void {
+  const scratch: WorksheetView | undefined = views.find((view: WorksheetView) => isScratch(view.name));
+  if (scratch === undefined) {
+    return;
+  }
+  activate(scratch);
+  scratch.insertSnippet(insertionOf(entry), entry.name);
+}
+
+/** A Library entry Ctrl+clicked: its declaration in its library. */
+function revealExport(entry: Export): void {
+  const view: WorksheetView | undefined = views.find((candidate: WorksheetView) => candidate.name === entry.document);
+  if (view !== undefined) {
+    activate(view);
+    view.goTo(entry.offset);
+  }
 }
 
 function makeSplitter(splitter: HTMLElement, onMove: (dx: number, dy: number) => void): void {
@@ -554,7 +582,7 @@ profileSelect.addEventListener("change", () => {
   active?.focus();
 });
 for (const tab of document.querySelectorAll<HTMLElement>(".side-tab")) {
-  tab.addEventListener("click", () => showPanel(tab.dataset.panel === "docs" ? "docs" : "inspector"));
+  tab.addEventListener("click", () => showPanel((tab.dataset.panel ?? "inspector") as Panel));
 }
 window.addEventListener("keydown", onKeyDown, true);
 
@@ -574,6 +602,7 @@ if (isTauri) {
   activeName: (): string | null => active?.name ?? null,
   profile: (): string => profile,
   tabNames: (): string[] => views.map((view: WorksheetView) => view.name),
+  library: (): string[] => library.rows(),
 };
 
 start().catch((error: unknown) => {
