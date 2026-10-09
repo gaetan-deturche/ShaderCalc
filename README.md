@@ -36,8 +36,9 @@ tanh(7.0)                                  // ⊘ 0.99999833 (WARP's tanh is off
 Worksheets live in `~/.shadercalc` (one `.hlsl` per tab, edits made outside the app reload live).
 
 The exe is portable: download `shadercalc.exe` from the
-[latest release](https://github.com/gaetan-deturche/ShaderCalc/releases/latest) and run it. When a newer release
-is out, the status bar offers it; the app checks its signature, replaces its own exe and restarts on a click.
+[latest release](https://github.com/gaetan-deturche/ShaderCalc/releases/latest) and run it. It looks for a newer
+release at start-up and every hour (Check for updates in the status bar, next to the version, looks now); the
+status bar offers it, and on a click the app checks its signature, replaces its own exe and restarts.
 
 ## Build
 

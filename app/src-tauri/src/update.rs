@@ -86,10 +86,7 @@ fn download(url: &str, limit: u64) -> Result<Vec<u8>, String> {
 
 /// Asks GitHub for the latest release; `Some` when it is newer than this build and correctly signed.
 pub fn check() -> Result<Option<Available>, String> {
-    // A build without a key (a local one) never updates
-    let Some(key) = public_key() else {
-        return Ok(None);
-    };
+    let key: VerifyingKey = public_key().ok_or("this build has no update key (a local build): it never updates")?;
     // SHADERCALC_UPDATE_URL points at another release (a local test); the signature check still applies
     let url: String = std::env::var("SHADERCALC_UPDATE_URL").unwrap_or_else(|_| LATEST_RELEASE.to_string());
     let release: Release = ureq::get(&url)

@@ -24,6 +24,11 @@ async fn run_command(command: String, args: Value, state: tauri::State<'_, Arc<B
 }
 
 #[tauri::command]
+fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+#[tauri::command]
 async fn check_update() -> Result<Option<update::Available>, String> {
     tauri::async_runtime::spawn_blocking(update::check).await.map_err(|error| error.to_string())?
 }
@@ -77,7 +82,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(Arc::new(backend))
-        .invoke_handler(tauri::generate_handler![run_command, check_update, install_update, restart_app])
+        .invoke_handler(tauri::generate_handler![run_command, app_version, check_update, install_update, restart_app])
         .run(tauri::generate_context!())
         .expect("ShaderCalc failed to start");
 }

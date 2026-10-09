@@ -17,6 +17,7 @@ const inspector: HTMLElement = document.getElementById("inspector") as HTMLEleme
 const statusText: HTMLElement = document.getElementById("status") as HTMLElement;
 const referenceText: HTMLElement = document.getElementById("reference-status") as HTMLElement;
 const folderText: HTMLElement = document.getElementById("folder") as HTMLElement;
+const versionText: HTMLElement = document.getElementById("app-version") as HTMLElement;
 const app: HTMLElement = document.getElementById("app") as HTMLElement;
 const profileSelect: HTMLSelectElement = document.getElementById("profile-select") as HTMLSelectElement;
 
@@ -453,32 +454,67 @@ function setupLayout(sideWidth: number): void {
 
 // ---------------------------------------------------------------- Updates (the app only)
 
+// Hourly, like Auger: releases come in bursts
+const UPDATE_CHECK_MS: number = 60 * 60 * 1000;
+
 const updateButton: HTMLButtonElement = document.getElementById("update-status") as HTMLButtonElement;
+const checkButton: HTMLButtonElement = document.getElementById("check-updates") as HTMLButtonElement;
 let updateStep: "available" | "installing" | "installed" | "failed" = "available";
 let offeredUpdate: UpdateInfo | null = null;
+let appVersion: string = "";
+let checkTimer: number | undefined;
 
 function showUpdate(text: string, title: string, step: typeof updateStep): void {
   updateButton.textContent = text;
   updateButton.title = title;
   updateButton.disabled = step === "installing";
   updateButton.classList.remove("hidden");
+  checkButton.classList.toggle("hidden", step === "installing" || step === "installed");
   updateStep = step;
 }
 
-async function checkForUpdate(): Promise<void> {
+/** The Check for updates link; `forMs` shows an outcome that long, then the link again. */
+function showCheck(text: string, title: string, forMs: number = 0, isBusy: boolean = false): void {
+  window.clearTimeout(checkTimer);
+  checkButton.textContent = text;
+  checkButton.title = title;
+  checkButton.disabled = isBusy;
+  if (forMs > 0) {
+    checkTimer = window.setTimeout(() => showCheck("Check for updates", checkTitle()), forMs);
+  }
+}
+
+function checkTitle(): string {
+  return `Look for a newer release now (ShaderCalc ${appVersion} also checks at start-up and every hour)`;
+}
+
+/** Asks GitHub for a newer release; a manual check says how it went where it was asked. */
+async function checkForUpdate(isManual: boolean = false): Promise<void> {
   if (updateStep === "installing" || updateStep === "installed") {
     return;
+  }
+  if (isManual) {
+    showCheck("Checking…", "Asking GitHub for the latest release", 0, true);
   }
   try {
     offeredUpdate = await appCommand<UpdateInfo | null>("check_update");
   } catch (error) {
-    // Offline or GitHub unreachable: say nothing, the next check may work
+    // Offline or GitHub unreachable: the next check may work
     console.warn(`update check: ${error}`);
+    if (isManual) {
+      showCheck("Update check failed", String(error), 8000);
+    }
     return;
   }
   if (offeredUpdate === null) {
     updateButton.classList.add("hidden");
+    if (isManual) {
+      showCheck("Up to date", `ShaderCalc ${appVersion} is the latest release`, 5000);
+    }
     return;
+  }
+  if (isManual) {
+    showCheck("Check for updates", checkTitle());
   }
   showUpdate(
     `Update to ${offeredUpdate.version}`,
@@ -565,8 +601,14 @@ async function start(): Promise<void> {
   await runEvaluation();
   window.setInterval(() => void pollChanges(), 1000);
   if (isTauri) {
+    appVersion = await appCommand<string>("app_version");
+    versionText.textContent = `ShaderCalc ${appVersion}`;
+    showCheck("Check for updates", checkTitle());
+    checkButton.classList.remove("hidden");
     window.setTimeout(() => void checkForUpdate(), 3000);
-    window.setInterval(() => void checkForUpdate(), 6 * 60 * 60 * 1000);
+    window.setInterval(() => void checkForUpdate(), UPDATE_CHECK_MS);
+  } else {
+    versionText.textContent = "ShaderCalc (browser dev build)";
   }
 }
 
@@ -575,6 +617,7 @@ document.getElementById("rename-button")?.addEventListener("click", () => void r
 document.getElementById("delete-button")?.addEventListener("click", () => void deleteActive());
 document.getElementById("folder-button")?.addEventListener("click", () => void call("openFolder"));
 updateButton.addEventListener("click", () => void onUpdateClick());
+checkButton.addEventListener("click", () => void checkForUpdate(true));
 profileSelect.addEventListener("change", () => {
   profile = profileSelect.value;
   void saveState();
