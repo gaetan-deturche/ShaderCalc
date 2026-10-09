@@ -195,7 +195,14 @@ pub(crate) fn exports_of(
                     .map(|parameter| parameter.name.clone())
                     .collect();
                 let signature: String = one_line(text.slice(function.span.offset, end));
-                add(ExportKind::Function, &function.name, signature, Some(parameters), function.span, function.name_span.offset);
+                add(
+                    ExportKind::Function,
+                    &function.name,
+                    signature,
+                    Some(parameters),
+                    function.span,
+                    function.name_span.offset,
+                );
             }
             DeclarationSyntax::Struct(structure) => {
                 let declaration: String = one_line(text.span(structure.span));
@@ -208,7 +215,14 @@ pub(crate) fn exports_of(
             DeclarationSyntax::GlobalVariable(global) => {
                 let texts: Vec<String> = declarator_texts(&text, &global.declaration);
                 for (declarator, declaration) in global.declaration.declarators.iter().zip(texts) {
-                    add(ExportKind::Variable, &declarator.name, declaration, None, global.span, declarator.name_span.offset);
+                    add(
+                        ExportKind::Variable,
+                        &declarator.name,
+                        declaration,
+                        None,
+                        global.span,
+                        declarator.name_span.offset,
+                    );
                 }
             }
         }

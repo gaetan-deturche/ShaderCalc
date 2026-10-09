@@ -43,6 +43,15 @@ impl From<&Diagnostic> for DiagnosticDto {
     }
 }
 
+/// A float's sign, exponent or mantissa: its top and bottom bit.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BitFieldDto {
+    pub name: &'static str,
+    pub high: u32,
+    pub low: u32,
+}
+
 /// One flattened component: its name (.x, [1][0], .Field), value, hex and bit pattern.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,6 +62,11 @@ pub struct ComponentDto {
     pub bits: String,
     /// The raw bits, to compare with the reference's.
     pub raw: String,
+    /// The bits the inspector draws (0 for bool), and a float's fields.
+    pub width: u32,
+    pub fields: Vec<BitFieldDto>,
+    /// What a float's exponent means: zero, denormal, infinity, NaN or 2^e.
+    pub exponent_meaning: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -103,28 +117,72 @@ fn component_names(ty: &ShaderType, prefix: &str, names: &mut Vec<String>) {
 pub fn hex(kind: ScalarKind, bits: u64) -> String {
     match kind {
         ScalarKind::Bool => (if bits != 0 { "1" } else { "0" }).to_string(),
+        ScalarKind::Half => format!("0x{:04X}", bits as u16),
         _ if kind.is_64bit() => format!("0x{bits:016X}"),
         _ => format!("0x{:08X}", bits as u32),
     }
 }
 
+/// A float kind's width and exponent width (a 16-bit half is Slang's; HLSL's half is a float).
+fn float_layout(kind: ScalarKind) -> Option<(u32, u32)> {
+    match kind {
+        ScalarKind::Half => Some((16, 5)),
+        ScalarKind::Float => Some((32, 8)),
+        ScalarKind::Double | ScalarKind::LiteralFloat => Some((64, 11)),
+        _ => None,
+    }
+}
+
+fn bit_width(kind: ScalarKind) -> u32 {
+    match kind {
+        ScalarKind::Bool => 0,
+        _ if kind.is_64bit() => 64,
+        _ => float_layout(kind).map_or(32, |(width, _)| width),
+    }
+}
+
+fn float_fields(kind: ScalarKind) -> Vec<BitFieldDto> {
+    let Some((width, exponent_width)) = float_layout(kind) else {
+        return Vec::new();
+    };
+    let mantissa_width: u32 = width - 1 - exponent_width;
+    vec![
+        BitFieldDto { name: "sign", high: width - 1, low: width - 1 },
+        BitFieldDto { name: "exponent", high: width - 2, low: mantissa_width },
+        BitFieldDto { name: "mantissa", high: mantissa_width - 1, low: 0 },
+    ]
+}
+
+/// The exponent and mantissa fields of a float's bits.
+fn float_parts(kind: ScalarKind, bits: u64) -> Option<(u64, u64)> {
+    let (width, exponent_width) = float_layout(kind)?;
+    let mantissa_width: u32 = width - 1 - exponent_width;
+    Some(((bits >> mantissa_width) & ((1 << exponent_width) - 1), bits & ((1 << mantissa_width) - 1)))
+}
+
+fn exponent_meaning(kind: ScalarKind, bits: u64) -> Option<String> {
+    let (_, exponent_width) = float_layout(kind)?;
+    let (exponent, mantissa) = float_parts(kind, bits)?;
+    let maximum: u64 = (1 << exponent_width) - 1;
+    Some(match exponent {
+        0 => (if mantissa == 0 { "zero" } else { "denormal" }).to_string(),
+        _ if exponent == maximum => (if mantissa == 0 { "infinity" } else { "NaN" }).to_string(),
+        _ => format!("2^{}", exponent as i64 - (maximum >> 1) as i64),
+    })
+}
+
 /// Floats as sign | exponent | mantissa with the decoded exponent; integers in groups of 8 bits.
 pub fn bit_pattern(kind: ScalarKind, bits: u64) -> String {
+    if let (Some((width, exponent_width)), Some((exponent, mantissa))) = (float_layout(kind), float_parts(kind, bits)) {
+        let mantissa_width: usize = (width - 1 - exponent_width) as usize;
+        let meaning: String = exponent_meaning(kind, bits).unwrap_or_default();
+        let sign: u64 = (bits >> (width - 1)) & 1;
+        return format!(
+            "{sign} {exponent:0exponent_width$b} {mantissa:0mantissa_width$b}  ({meaning})",
+            exponent_width = exponent_width as usize
+        );
+    }
     match kind {
-        ScalarKind::Float => {
-            let word: u32 = bits as u32;
-            let exponent: u32 = (word >> 23) & 0xFF;
-            let mantissa: u32 = word & 0x7F_FFFF;
-            let meaning: String = match exponent {
-                0 => (if mantissa == 0 { "zero" } else { "denormal" }).to_string(),
-                255 => (if mantissa == 0 { "infinity" } else { "NaN" }).to_string(),
-                _ => format!("2^{}", exponent as i32 - 127),
-            };
-            format!("{} {:08b} {:023b}  ({})", word >> 31, exponent, mantissa, meaning)
-        }
-        ScalarKind::Double => {
-            format!("{} {:011b} {:052b}", bits >> 63, (bits >> 52) & 0x7FF, bits & 0xF_FFFF_FFFF_FFFF)
-        }
         ScalarKind::Bool => (if bits != 0 { "true" } else { "false" }).to_string(),
         _ => {
             let binary: String = if kind.is_64bit() { format!("{bits:064b}") } else { format!("{:032b}", bits as u32) };
@@ -166,6 +224,9 @@ impl From<&Value> for ValueDto {
                     hex: hex(kind, bits),
                     bits: bit_pattern(kind, bits),
                     raw: bits.to_string(),
+                    width: bit_width(kind),
+                    fields: float_fields(kind),
+                    exponent_meaning: exponent_meaning(kind, bits),
                 }
             })
             .collect();

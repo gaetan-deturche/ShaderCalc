@@ -112,7 +112,9 @@ component is raw `u64` bits plus a `UnitTag`).
   wrapping: it would break the alignment. Squiggles and hover through `@codemirror/lint`, plus completion.
   `hlsl.ts`: a `StreamLanguage` from the legacy clike mode (`indentStatements: false`, else new lines indent).
 - `inspector.ts`: type, units, per-component value/hex/bits, problems, the reference verdict and the emitted HLSL.
-  `docs.ts`: the docs panel (`marked`). `library.ts`: the Library panel from `evaluate`'s `exports`, grouped by
+  Bits (`buildBits`): drawn from `ComponentDto::raw` (BigInt) with `width` and the float `fields` from the backend
+  (`dto.rs` `float_layout`: half 1/5/10, float 1/8/23, double 1/11/52); groups of 4 labelled with their top bit,
+  a wider gap between bytes, 32 bits a row, fields coloured, bits that differ from WARP's marked. `docs.ts`: the docs panel (`marked`). `library.ts`: the Library panel from `evaluate`'s `exports`, grouped by
   library in tab order (re-rendered only when they change). Click → `WorksheetView.insertSnippet` in the scratch
   pad (a CodeMirror snippet, parameters as numbered fields; it replaces a partly typed name, stays inline in an
   expression or on a blank line, else goes on a new line); Ctrl+click → `goTo` the name's offset.

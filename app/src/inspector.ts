@@ -1,4 +1,4 @@
-import { Component, Diagnostic, Line, Reference, ValueInfo } from "./types";
+import { BitField, Component, Diagnostic, Line, Reference, ValueInfo } from "./types";
 
 function element<K extends keyof HTMLElementTagNameMap>(tag: K, className: string = "", text: string = ""): HTMLElementTagNameMap[K] {
   const node: HTMLElementTagNameMap[K] = document.createElement(tag);
@@ -66,16 +66,16 @@ function buildComponents(value: ValueInfo, reference: Reference | undefined): HT
   value.components.forEach((component: Component, index: number) => {
     const theirs: Component | undefined = referenceValue?.components[index];
     const differs: boolean = theirs !== undefined && theirs.raw !== component.raw;
-    addComponent(table, component.name, component, differs ? "error" : "");
+    addComponent(table, component.name, component, differs ? "error" : "", differs ? theirs : undefined);
     if (differs && theirs !== undefined) {
-      addComponent(table, "WARP", theirs, "dim");
+      addComponent(table, "WARP", theirs, "dim", component);
     }
   });
   return table;
 }
 
-/** name · value · hex, and the bit pattern on its own line underneath. */
-function addComponent(table: HTMLTableElement, name: string, component: Component, className: string): void {
+/** name · value · hex, and the bits underneath (those that differ from `other` marked). */
+function addComponent(table: HTMLTableElement, name: string, component: Component, className: string, other: Component | undefined): void {
   const row: HTMLTableRowElement = table.insertRow();
   row.className = className;
   for (const text of [name, component.text, component.hex]) {
@@ -85,7 +85,59 @@ function addComponent(table: HTMLTableElement, name: string, component: Componen
   bitsRow.className = "bits";
   const cell: HTMLTableCellElement = bitsRow.insertCell();
   cell.colSpan = 3;
-  cell.textContent = component.bits;
+  if (component.width === 0) {
+    cell.textContent = component.bits;
+  } else {
+    cell.append(buildBits(component, other));
+  }
+}
+
+function bitAt(value: bigint, index: number): number {
+  return Number((value >> BigInt(index)) & 1n);
+}
+
+/**
+ * The bits in groups of 4, each labelled with its top bit's index, a wider gap between bytes and 32 bits a row;
+ * a float's sign / exponent / mantissa coloured, with their values underneath. Hover a bit for its index.
+ */
+function buildBits(component: Component, other: Component | undefined): HTMLElement {
+  const value: bigint = BigInt(component.raw);
+  const otherValue: bigint | null = other === undefined ? null : BigInt(other.raw);
+  const fieldOf = (index: number): BitField | undefined => component.fields.find((field: BitField) => field.low <= index && index <= field.high);
+  const grid: HTMLElement = element("div", "bit-grid");
+  for (let rowTop = component.width - 1; rowTop >= 0; rowTop -= 32) {
+    const row: HTMLElement = element("div", "bit-row");
+    for (let groupTop = rowTop; groupTop > rowTop - 32 && groupTop >= 0; groupTop -= 4) {
+      const group: HTMLElement = element("span", groupTop !== rowTop && groupTop % 8 === 7 ? "bit-group byte" : "bit-group");
+      const bits: HTMLElement = element("span", "bit-values");
+      for (let index = groupTop; index > groupTop - 4 && index >= 0; index--) {
+        const bit: number = bitAt(value, index);
+        const field: BitField | undefined = fieldOf(index);
+        const differs: boolean = otherValue !== null && bitAt(otherValue, index) !== bit;
+        const span: HTMLElement = element("span", `bit ${bit === 1 ? "one" : "zero"} ${field?.name ?? ""}${differs ? " differs" : ""}`, String(bit));
+        span.title = `bit ${index}` + (field === undefined ? "" : ` · ${field.name} bit ${index - field.low}`) + ` = ${bit}` + (differs ? " (differs)" : "");
+        bits.append(span);
+      }
+      group.append(element("span", "bit-index", String(groupTop)), bits);
+      row.append(group);
+    }
+    grid.append(row);
+  }
+  if (component.fields.length > 0) {
+    const legend: HTMLElement = element("div", "bit-legend");
+    for (const field of component.fields) {
+      const bits: bigint = (value >> BigInt(field.low)) & ((1n << BigInt(field.high - field.low + 1)) - 1n);
+      const text: string =
+        field.name === "sign"
+          ? `sign ${bits}`
+          : field.name === "exponent"
+            ? `exponent ${bits}${component.exponentMeaning === null ? "" : ` → ${component.exponentMeaning}`}`
+            : `mantissa 0x${bits.toString(16).toUpperCase()}`;
+      legend.append(element("span", field.name, text));
+    }
+    grid.append(legend);
+  }
+  return grid;
 }
 
 function buildReference(reference: Reference | undefined): HTMLElement {

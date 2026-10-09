@@ -531,6 +531,80 @@ table.components tr.dim td {
   color: var(--dim);
 }
 
+/* Bits: groups of 4 under their top bit's index */
+.bit-grid {
+  padding: 2px 0 4px;
+}
+
+.bit-row {
+  display: flex;
+  gap: 7px;
+}
+
+.bit-row + .bit-row {
+  margin-top: 3px;
+}
+
+.bit-group {
+  display: inline-flex;
+  flex-direction: column;
+}
+
+.bit-group.byte {
+  margin-left: 7px;
+}
+
+.bit-index {
+  font-size: 10.5px;
+  line-height: 1.3;
+  color: var(--dim);
+  opacity: 0.8;
+}
+
+.bit-values {
+  font-size: 14px;
+  color: var(--text);
+}
+
+.bit {
+  display: inline-block;
+  width: 1ch;
+  text-align: center;
+}
+
+.bit.zero {
+  opacity: 0.5;
+}
+
+.bit.sign,
+.bit-legend .sign {
+  color: var(--syntax-preprocessor);
+}
+
+.bit.exponent,
+.bit-legend .exponent {
+  color: var(--syntax-type);
+}
+
+.bit.mantissa,
+.bit-legend .mantissa {
+  color: var(--syntax-number);
+}
+
+.bit.differs {
+  opacity: 1;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--error) 35%, transparent);
+}
+
+.bit-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 4px;
+  font-size: 11.5px;
+}
+
 .problem {
   margin: 0 0 4px;
 }

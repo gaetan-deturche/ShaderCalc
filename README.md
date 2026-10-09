@@ -28,8 +28,9 @@ tanh(7.0)                                  // ⊘ 0.99999833 (WARP's tanh is off
   reported where they happen. SI units with every prefix, bytes and bits, US units.
 - **Profiles**: HLSL as DXC and WARP compute it (the default), or Slang's CPU target (C rules, the C library's
   functions, a 16-bit `half`), switched in the toolbar.
-- **Bits**: the inspector shows each component's type, value, hex and bit pattern, the problems on the line
-  and the reference verdict.
+- **Bits**: the inspector shows each component's type, value, hex and bits (in groups of 4 under their bit
+  index, a float's sign, exponent and mantissa coloured, the bits that differ from WARP marked), the problems on
+  the line and the reference verdict.
 - **Docs**: F1 on a name opens its page (signature, DXC lowering, WARP behaviour); the Docs tab searches them.
 
 Worksheets live in `~/.shadercalc` (one `.hlsl` per tab, edits made outside the app reload live).

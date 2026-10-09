@@ -42,12 +42,24 @@ export interface Diagnostic {
   text: string;
 }
 
+/** A float's sign, exponent or mantissa: its top and bottom bit. */
+export interface BitField {
+  name: "sign" | "exponent" | "mantissa";
+  high: number;
+  low: number;
+}
+
 export interface Component {
   name: string;
   text: string;
   hex: string;
   bits: string;
+  /** The bits as an unsigned decimal (up to 64 bits: read with BigInt). */
   raw: string;
+  /** The bits the inspector draws (0 for bool). */
+  width: number;
+  fields: BitField[];
+  exponentMeaning: string | null;
 }
 
 export interface ValueInfo {
