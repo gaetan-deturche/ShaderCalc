@@ -165,9 +165,10 @@ component is raw `u64` bits plus a `UnitTag`).
   `include_str!`; empty = updates off, the state of local builds: the check then errors). `install_update` downloads the exe,
   checks size + SHA-256, renames the running exe to `.exe.old` and puts the new one in place. `restart_app` starts
   it with `--updated-from <pid>`: `finish_update` (start of `main`) waits for that process, then deletes `.old`.
-  The frontend checks 3 s after start and hourly (`UPDATE_CHECK_MS`, like Auger; Tauri only); the status bar
-  button goes "Update to X" → "Restart to update". The status bar's right end shows `ShaderCalc <app_version>`
-  (the exe's `CARGO_PKG_VERSION`) and a Check for updates link that reports "Up to date" or the failure.
+  The frontend checks 3 s after start and hourly (`UPDATE_CHECK_MS`, like Auger; Tauri only). The status bar's
+  right end shows `ShaderCalc <app_version>` (the exe's `CARGO_PKG_VERSION`), then one spot: a Check for updates
+  link that reports "Up to date" or the failure, replaced by the update button ("Update to X" → "Restart to
+  update") once a release is found.
   `SHADERCALC_UPDATE_URL` replaces the GitHub URL (tests); the signature is still required.
 - Release: `scripts/bump-version.ps1 X.Y.Z` (tauri.conf.json, app Cargo.toml, package.json, the locks), commit,
   tag `vX.Y.Z`, push the tag. `.github/workflows/release.yml` checks the tag against the versions, tests, builds,

@@ -478,7 +478,7 @@ function showUpdate(text: string, title: string, step: typeof updateStep): void 
   updateButton.title = title;
   updateButton.disabled = step === "installing";
   updateButton.classList.remove("hidden");
-  checkButton.classList.toggle("hidden", step === "installing" || step === "installed");
+  checkButton.classList.add("hidden");
   updateStep = step;
 }
 
@@ -517,6 +517,7 @@ async function checkForUpdate(isManual: boolean = false): Promise<void> {
   }
   if (offeredUpdate === null) {
     updateButton.classList.add("hidden");
+    checkButton.classList.remove("hidden");
     if (isManual) {
       showCheck("Up to date", `ShaderCalc ${appVersion} is the latest release`, 5000);
     }
