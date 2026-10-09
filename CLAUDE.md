@@ -99,7 +99,8 @@ component is raw `u64` bits plus a `UnitTag`).
 
 ## Build / test
 
-- `scripts/fetch-dxc.ps1` once (or copy `dxcompiler.dll` + `dxil.dll` 1.9.2602 into `third_party/dxc`).
+- `scripts/fetch-dxc.ps1` once (or copy `dxcompiler.dll` + `dxil.dll` 1.9.2602 into `third_party/dxc`). Its
+  download is byte-identical to the 1.9.2602.17 DLLs from NuGet `vortice.dxc.native` 1.0.5.
 - `cargo test --workspace`: the reference and conformance tests run on WARP, so they need the DLLs.
 - Frontend: `cd app && npm install && npm run build` (`tsc --noEmit` + `vite build`).
 - Exe: `cd app && npx tauri build --no-bundle` → `target/release/shadercalc.exe`. The NSIS bundle target is
@@ -113,10 +114,16 @@ component is raw `u64` bits plus a `UnitTag`).
   `window.shaderCalc.{results, activeName, tabNames}`. Pane screenshots time out while the pane is hidden; read
   the page with `get_page_text` / `javascript_tool` instead.
 - Desktop exe: hidden desktop only (shared memory `no-focus-steal-gui-testing`). The tooling is in `Claude/`
-  (gitignored). `run-hidden.ps1 -Driver tauri-drive.ps1` creates the `ShaderCalcTest` desktop and runs
-  `tauri-drive.ps1` there: it seeds a data folder, starts the exe without `SHADERCALC_DXC_DIR` (so the embedded DXC
-  is used), reads the page through UI Automation (WebView2 exposes the text), closes the window with
-  `WindowPattern.Close` and checks the saved files. A watchdog kills the run's ShaderCalc if it shows a window on
-  the user's desktop.
+  (gitignored). `run-hidden.ps1 -Driver tauri-drive.ps1 -TimeoutSeconds 300` creates the `ShaderCalcTest` desktop
+  and runs `tauri-drive.ps1` there: it seeds a data folder, starts `target/release/shadercalc.exe` without
+  `SHADERCALC_DXC_DIR` (so the embedded DXC is used), runs `tauri-scenario.mjs`, closes the window with UI
+  Automation's `WindowPattern.Close` and checks the saved files.
+- `tauri-scenario.mjs` (node) drives the page through WebView2's DevTools port
+  (`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=...`, in a separate `WEBVIEW2_USER_DATA_FOLDER`).
+  CDP input events reach the page without OS focus. It covers state.json, results and marks, the inspector, F1,
+  outside edits, Ctrl+T, typing + autosave, F2 rename, completion, Delete + confirm, and page errors. Wait 200 ms
+  before accepting a completion: CodeMirror ignores Enter for 75 ms after the list opens.
+- The watchdog only acts on the PIDs drivers write to `Claude/out/app.pid`, so a ShaderCalc the user runs is never
+  killed. It kills the run's app if a window of it shows up on the user's desktop.
 - Differential testing against the C# version: `Claude/diff/` (`make_corpus.py` → `corpus.json`, `csharp/` and
   `rust/` runners). The C# runner needs a checkout of `5671300`.
