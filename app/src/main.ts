@@ -439,8 +439,9 @@ function onKeyDown(event: KeyboardEvent): void {
     void newWorksheet();
   } else if (isControl && event.key.toLowerCase() === "s") {
     void saveUnsaved();
-  } else if (event.key === "Escape" && active !== null && !active.view.hasFocus) {
-    // Esc anywhere else (docs search, inspector...) goes back to the code
+  } else if (event.key === "Escape" && active !== null && !active.view.dom.contains(document.activeElement)) {
+    // Esc outside the editor (docs search, inspector...) goes back to the code; inside it (the find panel) it's
+    // CodeMirror's
     active.focus();
   } else {
     return;

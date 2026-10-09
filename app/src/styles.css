@@ -13,7 +13,8 @@
   --editor-fg: #1f1f1f;
   --result-bg: #f5f5f5;
   --line-numbers: #8a8a8a;
-  --active-line: #f0f4fa;
+  /* Translucent: CodeMirror draws the selection under the lines */
+  --active-line: rgba(0, 95, 184, 0.06);
   --selection: #add6ff;
   --selected-line: rgba(173, 214, 255, 0.5);
   --code-bg: #f3f3f3;
@@ -46,7 +47,7 @@
     --editor-fg: #d4d4d4;
     --result-bg: #252526;
     --line-numbers: #6e7681;
-    --active-line: #262a31;
+    --active-line: rgba(130, 170, 240, 0.07);
     --selection: #264f78;
     --selected-line: rgba(38, 79, 120, 0.5);
     --code-bg: #181818;
@@ -296,6 +297,7 @@ select {
 }
 
 /* ---- CodeMirror ---- */
+/* .editor-host in front: CodeMirror's own theme rules carry a generated class (.ͼ2 .cm-gutters) and would win */
 
 .cm-editor {
   background: var(--editor-bg);
@@ -312,14 +314,14 @@ select {
   line-height: 1.45;
 }
 
-.cm-gutters {
+.editor-host .cm-gutters {
   background: var(--editor-bg);
   color: var(--line-numbers);
   border-right: none;
 }
 
-.cm-activeLine,
-.cm-activeLineGutter {
+.editor-host .cm-activeLine,
+.editor-host .cm-activeLineGutter {
   background: var(--active-line);
 }
 
@@ -327,7 +329,7 @@ select {
   caret-color: var(--editor-fg);
 }
 
-.cm-cursor {
+.editor-host .cm-cursor {
   border-left-color: var(--editor-fg);
 }
 
@@ -337,24 +339,83 @@ select {
   background: var(--selection) !important;
 }
 
-.cm-tooltip {
+.editor-host .cm-tooltip {
   background: var(--surface);
   border: 1px solid var(--border);
   color: var(--text);
 }
 
-.cm-tooltip-autocomplete ul li[aria-selected] {
+.editor-host .cm-tooltip-autocomplete ul li[aria-selected] {
   background: var(--accent);
   color: var(--editor-bg);
 }
 
-.cm-completionDetail {
+.editor-host .cm-completionDetail {
   color: var(--dim);
   font-size: 11px;
   margin-left: 1em;
 }
 
-.cm-completionInfo {
+/* Find panel (Ctrl+F) */
+.editor-host .cm-editor .cm-panels {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.editor-host .cm-editor .cm-panels-bottom {
+  border-top: 1px solid var(--border);
+}
+
+.editor-host .cm-editor .cm-panel.cm-search {
+  padding: 6px 32px 6px 8px;
+  font-size: 12px;
+}
+
+.editor-host .cm-editor .cm-textfield {
+  font: inherit;
+  color: var(--text);
+  background: var(--button);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+
+.editor-host .cm-editor .cm-textfield:focus {
+  outline: 1px solid var(--accent);
+}
+
+.editor-host .cm-editor .cm-button {
+  font: inherit;
+  color: var(--text);
+  background: var(--button);
+  background-image: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 10px;
+}
+
+.editor-host .cm-editor .cm-button:hover {
+  background: var(--button-hover);
+}
+
+.editor-host .cm-editor .cm-search label {
+  font-size: inherit;
+}
+
+.editor-host .cm-editor .cm-search [name="close"] {
+  top: 5px;
+  right: 8px;
+  color: var(--dim);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.editor-host .cm-editor .cm-search [name="close"]:hover {
+  color: var(--text);
+}
+
+.editor-host .cm-completionInfo {
   color: var(--text);
   white-space: pre-wrap;
   font-family: var(--mono);
